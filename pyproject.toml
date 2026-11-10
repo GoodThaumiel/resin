@@ -80,14 +80,15 @@ ban-relative-imports = "all"
 [tool.ruff.lint.isort]
 known-first-party = [
   "resin",
+  "resin_models_ascend",
   "resin_models_cuda",
   "resin_models_mlx",
   "resin_models_torch",
 ]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "models/cuda", "models/mlx", "models/torch"]
-testpaths = ["tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests"]
+pythonpath = [".", "models/ascend", "models/cuda", "models/mlx", "models/torch"]
+testpaths = ["tests", "models/ascend/tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests"]
 
 [tool.uv]
 default-groups = ["dev"]

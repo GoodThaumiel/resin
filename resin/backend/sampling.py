@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from inspect import signature
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy as np
@@ -23,6 +24,15 @@ _TokenIds = (
 )
 
 SAMPLING_OFFSET_STRIDE = 32
+
+
+def _compile_sampling(function):
+    # The Ascend PyTorch 2.10 stack does not accept recompile_limit.
+    if "recompile_limit" not in signature(torch.compile).parameters:
+        return function
+    return torch.compile(  # ty: ignore[no-matching-overload]
+        function, dynamic=True, fullgraph=True, recompile_limit=128
+    )
 
 
 def _offsets(counts: npt.NDArray[np.uint32]) -> npt.NDArray[np.uint32]:
@@ -98,9 +108,7 @@ class PromptScores:
         return columns
 
 
-@torch.compile(  # ty: ignore[no-matching-overload]
-    dynamic=True, fullgraph=True, recompile_limit=128
-)
+@_compile_sampling
 def _score_tensors(
     logits: torch.Tensor,
     selected: torch.Tensor,
@@ -415,9 +423,7 @@ def batch_sampling_inputs(plan: BatchPlan, vocab_size: int) -> _SamplingInputs:
     }
 
 
-@torch.compile(  # ty: ignore[no-matching-overload]
-    dynamic=True, fullgraph=True, recompile_limit=128
-)
+@_compile_sampling
 def _sampling_distribution(
     logits: torch.Tensor,
     temperature: torch.Tensor,

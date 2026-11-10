@@ -15,6 +15,7 @@ resolution-markers = [
 [manifest]
 members = [
     "resin",
+    "resin-models-ascend",
     "resin-models-cuda",
     "resin-models-mlx",
     "resin-models-torch",
@@ -3561,6 +3562,23 @@ dev = [
     { name = "tokenizers", specifier = ">=0.22.2" },
     { name = "transformers", specifier = ">=5.14.1" },
     { name = "ty", specifier = ">=0.0.90" },
+]
+
+[[package]]
+name = "resin-models-ascend"
+version = "0.1.0"
+source = { editable = "models/ascend" }
+dependencies = [
+    { name = "resin" },
+    { name = "safetensors" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "resin", editable = "." },
+    { name = "safetensors", specifier = ">=0.5" },
+    { name = "transformers", specifier = ">=5.14.1" },
 ]
 
 [[package]]
