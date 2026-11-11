@@ -390,7 +390,9 @@ class QwenAscendRunner:
                     output_rows[row] = [token]
         for row, sample in enumerate(plan.sampling_mask):
             if not sample:
-                output_rows[row] = []
+                # Engine requires one token per prefill row and discards it
+                # when this chunk does not sample.
+                output_rows[row] = [0]
         packed_logits = None
         if plan.needs_logprobs:
             width = max(scores.shape[0] for scores in logits)

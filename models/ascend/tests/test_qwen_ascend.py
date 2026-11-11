@@ -80,6 +80,27 @@ def make_checkpoint(root, *, accept_draft=True, quantize=False):
     return config
 
 
+def test_chunked_prefill_returns_tokens_only_for_completed_prompts(tmp_path):
+    make_checkpoint(tmp_path)
+    runner = QwenAscendRunner(
+        tmp_path, device=torch.device("cpu"), cache_pages=16, prefill_chunk=64
+    )
+    params = SamplingParams(temperature=0, max_output_tokens=1)
+    with Engine(
+        runner, context_length=256, max_running_requests=2, enable_overlap=False
+    ) as engine:
+        long = engine.submit([1] * 65, sampling_params=params)
+        short = engine.submit([1], sampling_params=params)
+
+        assert [event.token_id for event in engine.step()] == [3]
+        assert short.done and not long.done
+        assert short.take_result() == [3]
+
+        assert [event.token_id for event in engine.step()] == [3]
+        assert long.done
+        assert long.take_result() == [3]
+
+
 @pytest.mark.parametrize("accept_draft", [True, False])
 def test_mtp_matches_target_across_page_and_prefill_chunks(tmp_path, accept_draft):
     make_checkpoint(tmp_path, accept_draft=accept_draft)
