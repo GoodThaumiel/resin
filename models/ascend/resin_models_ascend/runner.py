@@ -20,7 +20,7 @@ from resin import (
     RunnerConfig,
     RunnerMetrics,
 )
-from resin.backend.ascend.graphs import DecodeGraph
+from resin.backend.ascend.graphs import GRAPH_MODES, DecodeGraph
 from resin.backend.ascend.ops import NativePagedAttention
 from resin.backend.plans import CacheGroupView, PagedCachePlan
 from resin.backend.resources import CachePoolBinding
@@ -72,16 +72,16 @@ class QwenAscendRunner:
             raise ValueError(
                 "cache pages, prefill chunk, and graph max pages must be positive"
             )
-        if graph not in {"eager", "npugraph_ex"} or attention not in {
+        if graph not in GRAPH_MODES or attention not in {
             "torch",
             "native",
         }:
             raise ValueError("unsupported Ascend graph or attention mode")
-        if graph == "npugraph_ex" and (
+        if graph != "eager" and (
             tp.size > 1 or mtp or device.type != "npu" or attention != "torch"
         ):
             raise ValueError(
-                "npugraph_ex requires single-card target-only decode with tensor attention"
+                f"{graph} requires single-card target-only decode with tensor attention"
             )
         if attention == "native" and device.type != "npu":
             raise ValueError("native attention requires an NPU")
@@ -202,7 +202,9 @@ class QwenAscendRunner:
         length = context + len(ids)
         pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
         bucket = 1 << (pages - 1).bit_length()
-        eligible = self.graph_mode == "npugraph_ex" and decode and len(ids) == 1
+        eligible = (
+            self.graph_mode != "eager" and decode and not verify and len(ids) == 1
+        )
         capture = eligible and bucket <= self.graph_max_pages
         positions, page_table, slots = self._page_table(
             group,
@@ -218,10 +220,24 @@ class QwenAscendRunner:
                 def forward(*args):
                     return self.model.target(*args, self.keys, self.values)
 
-                self.graphs[bucket] = DecodeGraph(forward, inputs)
+                log.info(
+                    "Capturing Ascend decode graph, mode=%s, page bucket=%d",
+                    self.graph_mode,
+                    bucket,
+                )
+                self.graphs[bucket] = DecodeGraph(forward, inputs, mode=self.graph_mode)
+                log.info(
+                    "Ascend decode graph captured, mode=%s, page bucket=%d",
+                    self.graph_mode,
+                    bucket,
+                )
             result = self.graphs[bucket].replay(inputs)
             self.graph_replays += 1
-            log.debug("Ascend decode graph replay, page bucket=%d", bucket)
+            log.debug(
+                "Ascend decode graph replay, mode=%s, page bucket=%d",
+                self.graph_mode,
+                bucket,
+            )
             return result
         if eligible:
             self.graph_fallbacks += 1

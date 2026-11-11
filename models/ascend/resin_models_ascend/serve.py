@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 
 from resin import Engine
+from resin.backend.ascend.graphs import GRAPH_MODES
 from resin.backend.ascend.runtime import create_groups, initialize_device
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.recipe import get_native_recipe
@@ -37,7 +38,7 @@ def main(argv=None):
     parser.add_argument("--quantization", choices=("bf16", "w8a8"), default="bf16")
     parser.add_argument("--attention", choices=("torch", "native"), default="torch")
     parser.add_argument("--native-gdn-prefill", action="store_true")
-    parser.add_argument("--graph", choices=("eager", "npugraph_ex"), default="eager")
+    parser.add_argument("--graph", choices=GRAPH_MODES, default="eager")
     parser.add_argument("--graph-max-pages", type=int, default=32)
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -55,7 +56,7 @@ def main(argv=None):
         parser.error("launch a single node with DP × TP processes, up to eight ranks")
     if args.graph != "eager" and (world != 1 or args.mtp or args.attention != "torch"):
         parser.error(
-            "npugraph_ex requires one card, target-only decode and --attention torch"
+            f"{args.graph} requires one card, target-only decode and --attention torch"
         )
     if (
         min(

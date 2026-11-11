@@ -72,10 +72,32 @@ curl --fail-with-body http://127.0.0.1:8000/v1/chat/completions \
 - Use `--native-gdn-prefill` after the `gdn_chunk` probe passes. Compare
   continued prefill against the reference path because the fused operator
   uses BF16 state at chunk boundaries.
-- Use `--graph npugraph_ex --verbose` for one-card target-only decode with
-  tensor attention. Compare the same prompts in eager and graph modes, including
-  prompts crossing a 128-token page boundary. Graph capture uses a reserved
-  scratch page. The configured graph page limit bounds the capture buckets.
+
+## Validate ACLGraph decode
+
+```bash
+resin-ascend-serve /models/Qwen3.5-4B --graph aclgraph --verbose
+```
+
+This mode captures each one-token target forward using TorchNPU's
+`NPUGraph`. `--graph npugraph_ex` uses the TorchNPU compile backend with the
+same decode eligibility. Both modes use tensor attention on one card, with
+eager prefill and sampling. Capture writes to a reserved scratch page. Each
+replay updates the input buffers with the live token, position, page table,
+write slot, and recurrent state.
+
+Send the same requests at temperature zero to eager and ACLGraph servers.
+Compare the generated output, including a decode that crosses a 128-token
+page boundary. With `--verbose`, look for `mode=aclgraph` capture and replay
+messages. `--graph-max-pages` controls the largest graph page bucket.
+Requests above that limit use eager decode and log a fallback.
+
+The paged-attention replay test varies the page table and position within a
+single captured graph. Run it in the server environment with pytest installed:
+
+```bash
+python3 -m pytest -q models/ascend/tests/test_qwen_ascend.py -k aclgraph
+```
 
 For HTTP throughput and TTFT, run the existing stress harness after installing
 its `httpx` dependency. Its report contains per-request timing and token counts

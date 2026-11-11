@@ -5,6 +5,7 @@ import torch
 from safetensors.torch import save_file
 
 from resin import Engine, Parallelism, SamplingParams
+from resin.backend.ascend.graphs import DecodeGraph
 from resin.backend.ascend.ops import DynamicInt8Linear, tensor_attention
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_ascend.checkpoint import load_model, shard_tensor
@@ -150,3 +151,44 @@ def test_padded_attention_reads_only_pages_in_chronological_order():
         torch.tensor([2]),
     )
     torch.testing.assert_close(output, torch.full_like(output, 3))
+
+
+@torch.inference_mode()
+def test_aclgraph_replays_paged_attention_with_updated_metadata():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an Ascend NPU")
+    device = torch.device("npu", torch.npu.current_device())
+    keys = torch.zeros((4, 128, 1, 256), dtype=torch.bfloat16, device=device)
+    values = torch.zeros_like(keys)
+    values[1, 0].fill_(2)
+    values[3].fill_(8)
+    eager_keys, eager_values = keys.clone(), values.clone()
+    query = torch.zeros((1, 4, 256), dtype=keys.dtype, device=device)
+    key = torch.zeros_like(keys[:1, 0])
+
+    def forward(query, key, value, slot, pages, position):
+        return (
+            tensor_attention(query, key, value, keys, values, slot, pages, position),
+        )
+
+    def inputs(value, slot, pages, position):
+        return (
+            query,
+            key,
+            torch.full_like(key, value),
+            torch.tensor([slot], device=device),
+            torch.tensor(pages, device=device),
+            torch.tensor([position], device=device),
+        )
+
+    first = inputs(4, 129, [1, 0], 1)
+    second = inputs(137, 256, [3, 2], 128)
+    graph = DecodeGraph(forward, first, mode="aclgraph")
+    torch.testing.assert_close(values[1:].cpu(), eager_values[1:].cpu())
+
+    for args in (first, second, first):
+        expected = tensor_attention(*args[:3], eager_keys, eager_values, *args[3:])
+        (actual,) = graph.replay(args)
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(values[1:].cpu(), eager_values[1:].cpu())
