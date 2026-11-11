@@ -66,11 +66,26 @@ class QwenAscendRunner:
         graph_capture_pages: Sequence[int] | None = None,
         graph_verify_batches: Sequence[int] | None = None,
         mtp: bool = False,
+        num_speculative_tokens: int | None = None,
         quantization: str = "bf16",
         graph: str = "eager",
         attention: str = "torch",
         native_gdn_prefill: bool = False,
     ) -> None:
+        if num_speculative_tokens is not None and (
+            type(num_speculative_tokens) is not int
+            or not 1 <= num_speculative_tokens < 2**32 - 1
+        ):
+            raise ValueError(
+                "num_speculative_tokens must be positive and fit the decode lease"
+            )
+        draft_count = (
+            num_speculative_tokens if num_speculative_tokens is not None else int(mtp)
+        )
+        mtp = draft_count > 0
+        verify_width = 1 + draft_count
+        if graph == "aclgraph" and verify_width > PAGE_TOKENS:
+            raise ValueError("verify query width exceeds the ACLGraph scratch page")
         if min(cache_pages, prefill_chunk, graph_max_pages) < 1:
             raise ValueError(
                 "cache pages, prefill chunk, and graph max pages must be positive"
@@ -101,11 +116,11 @@ class QwenAscendRunner:
                     "graph_verify_batches requires MTP and startup capture"
                 )
             if not graph_verify_batches or any(
-                type(size) is not int or not 1 <= size <= PAGE_TOKENS // 2
+                type(size) is not int or not 1 <= size <= PAGE_TOKENS // verify_width
                 for size in graph_verify_batches
             ):
                 raise ValueError(
-                    f"verify batch sizes must be in [1, {PAGE_TOKENS // 2}]"
+                    f"verify batch sizes must be in [1, {PAGE_TOKENS // verify_width}]"
                 )
         if graph != "eager" and (
             tp.size > 1 or device.type != "npu" or attention != "torch"
@@ -124,6 +139,7 @@ class QwenAscendRunner:
         )
         self.device = device
         self.mtp = mtp
+        self.num_speculative_tokens = draft_count
         self.native = NativePagedAttention(device) if attention == "native" else None
         self.native_gdn_prefill = native_gdn_prefill
         self.sampler = TorchSampler()
@@ -138,7 +154,7 @@ class QwenAscendRunner:
             cache_layout=self.layout,
             prefill_chunk_size=prefill_chunk,
             continuation_prefill=True,
-            max_accepted_per_step=2 if mtp else 1,
+            max_accepted_per_step=verify_width,
         )
         self.binding = CachePoolBinding(self.layout, resource="Ascend Qwen cache")
         self.states: dict[int, tuple[int, LiveState]] = {}
@@ -150,6 +166,7 @@ class QwenAscendRunner:
         self.graph_replays = 0
         self.graph_fallbacks = 0
         self.drafted = self.accepted = 0
+        self.verify_rows = 0
 
     def bind_resources(self, binding: ResourceBinding) -> None:
         pool_id = self.binding.validate(binding.cache_pool_id, binding.cache_layout)
@@ -183,7 +200,7 @@ class QwenAscendRunner:
         return RunnerMetrics(
             spec_draft_tokens=self.drafted,
             spec_accepted_tokens=self.accepted,
-            spec_verify_rows=self.drafted,
+            spec_verify_rows=self.verify_rows,
         )
 
     def _empty_state(self) -> LiveState:
@@ -300,9 +317,10 @@ class QwenAscendRunner:
     def _capture_startup_graphs(self, buckets: tuple[int, ...]) -> None:
         state = self._empty_state()
         kinds = ("target", "verify", "draft") if self.mtp else ("target",)
+        verify_width = 1 + self.num_speculative_tokens
         for bucket in buckets:
             for kind in kinds:
-                zero = self._long([0, 0] if kind == "verify" else [0])
+                zero = self._long([0] * (verify_width if kind == "verify" else 1))
                 pages = zero.new_zeros((bucket,))
                 inputs = (
                     (zero, state.hidden, zero, pages, zero)
@@ -316,7 +334,7 @@ class QwenAscendRunner:
                 for size in self.graph_verify_batches:
                     if size == 1:
                         continue
-                    ids = self._long(np.zeros((size, 2), dtype=np.int64))
+                    ids = self._long(np.zeros((size, verify_width), dtype=np.int64))
                     inputs = (
                         ids,
                         ids,
@@ -369,7 +387,7 @@ class QwenAscendRunner:
         eligible = (
             self.graph_mode != "eager"
             and decode
-            and len(ids) == (2 if verify else 1)
+            and len(ids) == (1 + self.num_speculative_tokens if verify else 1)
             and (not verify or self.graph_mode == "aclgraph")
         )
         kind = "verify" if verify else "target"
@@ -442,15 +460,20 @@ class QwenAscendRunner:
             return torch.stack(hidden), *(torch.stack(items, dim=1) for items in states)
 
         pages = max(
-            (context + 2 + PAGE_TOKENS - 1) // PAGE_TOKENS for _, context, _, _ in rows
+            (context + len(ids) + PAGE_TOKENS - 1) // PAGE_TOKENS
+            for _, context, _, ids in rows
         )
         bucket = 1 << (pages - 1).bit_length()
         graph = self.graphs.get(("verify", bucket, batch_size))
         metadata = [
             self._page_metadata(
-                group, row, context, context + 2, bucket=bucket if graph else pages
+                group,
+                row,
+                context,
+                context + len(ids),
+                bucket=bucket if graph else pages,
             )
-            for row, context, _, _ in rows
+            for row, context, _, ids in rows
         ]
         positions, page_table, slots = (
             self._long(np.stack(items)) for items in zip(*metadata, strict=True)
@@ -471,7 +494,7 @@ class QwenAscendRunner:
 
     def _verify_rows(self, plan, cache, policies):
         rows = []
-        drafts = []
+        draft_count = self.num_speculative_tokens
         for row, sequence in enumerate(plan.sequence_ids):
             context = int(plan.context_lengths[row])
             if not context or policies[row].temperature != 0:
@@ -479,46 +502,59 @@ class QwenAscendRunner:
             start, end = plan.token_range(row)
             ids = self._long(cache.batch.token_ids[start:end].astype(np.int64))
             state = self.states[int(sequence)][1]
-            draft_hidden = self._draft(
-                ids, state.hidden, cache.groups[MTP], row, context, decode=True
-            )
-            draft = self.model.logits(draft_hidden).argmax(dim=-1)
-            drafts.append(draft)
-            rows.append((row, context, state, torch.cat((ids, draft))))
+            candidates = [ids]
+            draft_hidden = state.hidden
+            for offset in range(draft_count):
+                draft_hidden = self._draft(
+                    candidates[-1],
+                    draft_hidden,
+                    cache.groups[MTP],
+                    row,
+                    context + offset,
+                    decode=True,
+                )
+                candidates.append(self.model.logits(draft_hidden).argmax(dim=-1))
+            rows.append((row, context, state, torch.cat(candidates)))
         if not rows:
             return {}
 
-        hidden, recurrent, convolution, first_rec, first_conv = self._verify_targets(
+        hidden, recurrent, convolution = self._verify_targets(
             cache.groups[TARGET], rows
         )
         scores = self.model.logits(hidden.flatten(0, 1)).unflatten(0, hidden.shape[:2])
-        decisions = torch.cat(
-            (scores.argmax(dim=-1), torch.stack(drafts)), dim=1
-        ).tolist()
+        drafts = torch.stack([ids[1:] for _, _, _, ids in rows])
+        decisions = torch.cat((scores.argmax(dim=-1), drafts), dim=1).tolist()
         results = {}
-        for index, ((row, context, _, _), (first, second, draft_id)) in enumerate(
+        for index, ((row, context, _, _), tokens) in enumerate(
             zip(rows, decisions, strict=True)
         ):
-            accepted = first == draft_id
-            self.drafted += 1
-            self.accepted += int(accepted)
+            targets, proposals = tokens[: draft_count + 1], tokens[draft_count + 1 :]
+            accepted = 0
+            for target, proposal in zip(targets[:-1], proposals, strict=True):
+                if target != proposal:
+                    break
+                accepted += 1
+            self.drafted += draft_count
+            self.accepted += accepted
+            self.verify_rows += 1
             if accepted:
+                # The draft chain used its own hidden states. Rebuild the
+                # committed draft KV from the verified target hidden states.
                 self._draft(
-                    drafts[index],
-                    hidden[index, :1],
+                    drafts[index, :accepted],
+                    hidden[index, :accepted],
                     cache.groups[MTP],
                     row,
                     context + 1,
                     decode=True,
                 )
-            advance = int(accepted)
             results[row] = (
                 scores[index],
-                [first, second] if accepted else [first],
+                targets[: accepted + 1],
                 LiveState(
-                    recurrent[:, index] if accepted else first_rec[:, index],
-                    convolution[:, index] if accepted else first_conv[:, index],
-                    hidden[index, advance : advance + 1],
+                    recurrent[:, index, accepted],
+                    convolution[:, index, accepted],
+                    hidden[index, accepted : accepted + 1],
                 ),
             )
         return results
@@ -530,7 +566,9 @@ class QwenAscendRunner:
             raise ValueError("Ascend Qwen supports text-only requests")
         decode = plan.phase == BatchPhase.DECODE
         cache = PagedCachePlan.from_plan(
-            plan, self.layout, decode_lookahead=int(self.mtp and decode)
+            plan,
+            self.layout,
+            decode_lookahead=self.num_speculative_tokens if decode else 0,
         )
         for row, sequence in enumerate(plan.sequence_ids):
             if decode and cache.batch.query_lengths[row] != 1:

@@ -53,8 +53,19 @@ def main(argv=None):
         help="also pre-capture MTP verify graphs for these exact request counts",
     )
     parser.add_argument("--mtp", action="store_true")
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        help="enable MTP and draft this many tokens by reusing the same MTP head",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.num_speculative_tokens is not None:
+        if not 1 <= args.num_speculative_tokens <= args.context_length:
+            parser.error(
+                "--num-speculative-tokens must be positive and at most --context-length"
+            )
+        args.mtp = True
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
@@ -75,7 +86,7 @@ def main(argv=None):
     if args.graph_verify_batches is not None and (
         not args.mtp or args.graph_capture_pages is None
     ):
-        parser.error("--graph-verify-batches requires --mtp and --graph-capture-pages")
+        parser.error("--graph-verify-batches requires MTP and --graph-capture-pages")
     if (
         min(
             args.context_length,
@@ -110,6 +121,7 @@ def main(argv=None):
                 cache_pages=args.cache_pages,
                 prefill_chunk=args.prefill_chunk,
                 mtp=args.mtp,
+                num_speculative_tokens=args.num_speculative_tokens,
                 quantization=args.quantization,
                 graph=args.graph,
                 graph_max_pages=args.graph_max_pages,
@@ -121,11 +133,14 @@ def main(argv=None):
             if args.context_length > runner.model.config.max_position_embeddings:
                 raise ValueError("context length exceeds checkpoint position capacity")
             if (
-                runner.layout.estimated_parent_count([args.context_length])
+                runner.layout.estimated_parent_count(
+                    [args.context_length + max(0, runner.num_speculative_tokens - 1)]
+                )
                 > args.cache_pages
             ):
                 raise ValueError(
-                    "cache pages cannot hold one request at the configured context length"
+                    "cache pages cannot hold one request and its speculative lookahead "
+                    "at the configured context length"
                 )
             recipe = None
             if groups is None or groups.is_driver:

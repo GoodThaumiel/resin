@@ -90,33 +90,38 @@ write slot, and recurrent state.
 ### MTP with ACLGraph
 
 ```bash
-resin-ascend-serve /models/Qwen3.5-4B --mtp --graph aclgraph \
+resin-ascend-serve /models/Qwen3.5-4B --num-speculative-tokens 3 --graph aclgraph \
   --graph-capture-pages 1 2 4 8 --graph-verify-batches 2 4 8 --verbose
 ```
 
-The checkpoint must include MTP weights. Greedy requests (`temperature=0`)
-use three distinct graph kinds: `target` for one-token target decode, `draft`
-for the one-token prediction head, and `verify` for the two-token target
-verification. Each configured page bucket captures all three at startup.
-Verification returns both the final state and the state after the anchor;
-rejection commits only the latter. Writes beyond the accepted prefix remain
-masked and are overwritten on subsequent execution. Live recurrent,
-convolution, and hidden states are copied before another row can replay the
-same graph. Verify warmup uses distinct slots in the reserved page.
+The checkpoint must include MTP weights. `--mtp` enables one draft token.
+`--num-speculative-tokens K` enables MTP and sets the draft count to K.
+For greedy requests (`temperature=0`), the same MTP head runs K times.
+Each step feeds back its token and MTP hidden state to the next step.
+The target verifies the anchor and K drafts in a single forward, commits
+the longest matching prefix, and emits the next token from the target.
+The verifier retains a recurrent and convolution state at each prefix.
+Accepted draft KV is rebuilt using the verified target hidden states.
+Writes beyond the accepted prefix are masked and overwritten on later steps.
+
+Each page bucket captures one-token `target`, one-step `draft`, and
+`verify` graphs at startup. Verify warmup uses distinct slots in the
+reserved page, so a captured batch must fit `B × (K + 1) <= 128`.
 
 With tensor attention, greedy MTP rows in a decode step share one batched
-target forward over two query tokens per row (anchor and draft). Their KV
+target forward over K + 1 query tokens per row. Their KV
 tables and GDN states remain independent. Draft generation, draft cache
 updates after acceptance, and ordinary target decode run per request.
 `--graph-verify-batches` captures additional verify graphs for exact request
 counts, with one graph for each combination of batch size and configured KV
-page bucket. A verify batch of four requests runs eight query tokens. The
+page bucket. At K=3, a verify batch of four requests runs 16 query tokens. The
 page bucket follows the longest sequence in the verify batch. If either
 dimension misses, verify runs as a batch in eager mode. A batch of one still
-uses the original per-request graph. The eager native attention path uses
+uses the per-request graph. The eager native attention path uses
 per-request verify.
 
-Logits projection, argmax, acceptance decisions, state commit, and prefill
+Logits projection, argmax, acceptance decisions, multi-token draft KV repair,
+state commit, and prefill
 remain eager. Positive-temperature requests use target-only sampling and
 maintain the draft cache. MTP graphs require one NPU and tensor attention;
 `--mtp --graph npugraph_ex`, TP graphs, and native-attention graphs remain

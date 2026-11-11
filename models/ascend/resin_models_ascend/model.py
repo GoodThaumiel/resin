@@ -122,7 +122,14 @@ def apply_rotary(value: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 def delta_rule(
-    q: Tensor, k: Tensor, v: Tensor, decay: Tensor, beta: Tensor, state: Tensor
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    decay: Tensor,
+    beta: Tensor,
+    state: Tensor,
+    *,
+    verify: bool = False,
 ):
     repeats = v.shape[-2] // q.shape[-2]
     q = q.float()
@@ -132,7 +139,7 @@ def delta_rule(
     q = q.repeat_interleave(repeats, dim=-2)
     k = k.repeat_interleave(repeats, dim=-2)
     outputs = []
-    first_state = state
+    prefixes = []
     for i in range(q.shape[-3]):
         state = state * decay[..., i, :].exp()[..., None, None]
         key = k[..., i, :, :].unsqueeze(-1)
@@ -140,10 +147,13 @@ def delta_rule(
             ..., i, :, None
         ]
         state = state + key * delta.unsqueeze(-2)
-        if i == 0:
-            first_state = state
+        if verify:
+            prefixes.append(state)
         outputs.append((state * q[..., i, :, :].unsqueeze(-1)).sum(-2))
-    return torch.stack(outputs, dim=-3).to(v.dtype), state, first_state
+    if verify:
+        # Insert the query axis before [heads, key_dim, value_dim].
+        state = torch.stack(prefixes, dim=-4)
+    return torch.stack(outputs, dim=-3).to(v.dtype), state
 
 
 class GatedDeltaNet(nn.Module):
@@ -167,7 +177,13 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(config.linear_value_dim, hidden, bias=False)
 
     def forward(
-        self, hidden: Tensor, state: Tensor, convolution: Tensor, native_prefill: bool
+        self,
+        hidden: Tensor,
+        state: Tensor,
+        convolution: Tensor,
+        native_prefill: bool,
+        *,
+        verify: bool = False,
     ):
         c = self.config
         width = c.linear_conv_kernel_dim
@@ -191,12 +207,11 @@ class GatedDeltaNet(nn.Module):
         beta = self.in_proj_b(hidden).sigmoid()
         if native_prefill:
             core, state = native_chunk_gdn(q, k, v, decay, beta, state)
-            first_state = state
         else:
-            core, state, first_state = delta_rule(q, k, v, decay, beta, state)
+            core, state = delta_rule(q, k, v, decay, beta, state, verify=verify)
         gate = self.in_proj_z(hidden).reshape_as(core)
         mixed = self.tp.sum(self.out_proj(self.norm(core, gate).flatten(-2)))
-        return mixed, state, first_state, window
+        return mixed, state, window
 
 
 class MLP(nn.Module):
@@ -302,7 +317,7 @@ class QwenModel(nn.Module):
     ):
         hidden = self.text.embed_tokens(ids.flatten())
         rotary = self.rotary(positions.flatten(), hidden.dtype)
-        states, windows, first_states, first_windows = [], [], [], []
+        states, windows = [], []
         full = linear = 0
         for layer in self.text.layers:
             normalized = layer.input_layernorm(hidden)
@@ -319,29 +334,30 @@ class QwenModel(nn.Module):
                 )
                 full += 1
             else:
-                mixed, state, first_state, window = layer.linear_attn(
+                mixed, state, window = layer.linear_attn(
                     normalized.reshape(*ids.shape, -1),
                     recurrent[linear],
                     convolution[linear],
                     native_prefill,
+                    verify=verify,
                 )
                 width = convolution.shape[-1]
                 states.append(state)
-                windows.append(window[..., ids.shape[-1] :])
                 if verify:
-                    first_states.append(first_state)
-                    first_windows.append(window[..., 1 : 1 + width])
+                    # Drop the incoming window and keep one window per prefix.
+                    windows.append(
+                        window.unfold(-1, width, 1)[..., 1:, :].transpose(-3, -2)
+                    )
+                else:
+                    windows.append(window[..., ids.shape[-1] :])
                 mixed = mixed.reshape_as(hidden)
                 linear += 1
             hidden = layer.finish(hidden, mixed)
-        result = (
+        return (
             self.text.norm(hidden).reshape(*ids.shape, -1),
             torch.stack(states),
             torch.stack(windows),
         )
-        if verify:
-            return (*result, torch.stack(first_states), torch.stack(first_windows))
-        return result
 
     def draft(
         self,

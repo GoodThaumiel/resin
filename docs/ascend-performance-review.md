@@ -55,8 +55,9 @@ AISBench 并发吞吐优先做真正的 batch 执行。大模型多卡优先考�
 
 ## 本次 MTP ACLGraph 的边界
 
-单卡 `--mtp --graph aclgraph`，greedy 单草稿 token。启动预捕获同时建立
-target、draft、verify 图；verify 保留 anchor 后的状态以处理拒绝。MTP 权重
+单卡 ACLGraph 支持 greedy MTP，`--mtp` 默认一个草稿 token，
+`--num-speculative-tokens K` 配置重复运行同一个 MTP head 的步数。启动预捕获建立
+target、draft、verify 图，verify 为每个前缀保留状态以处理拒绝。MTP 权重
 缺失时仍在加载阶段报错。prefill、LM head、接受判断、提交和采样仍在图外。
 TP graph、native attention graph、`--mtp --graph npugraph_ex` 暂未开放。
 有启动 bucket 配置时，未覆盖的 bucket 走 eager，不动态捕获。

@@ -168,8 +168,9 @@ def test_startup_aclgraph_captures_configured_buckets_before_decode(
 
 @pytest.mark.parametrize("accept_draft", [True, False])
 @pytest.mark.parametrize("graph", ["eager", "simulated_aclgraph", "npu_aclgraph"])
+@pytest.mark.parametrize("draft_count", [1, 3])
 def test_mtp_matches_target_across_page_and_prefill_chunks(
-    tmp_path, monkeypatch, accept_draft, graph
+    tmp_path, monkeypatch, accept_draft, graph, draft_count
 ):
     device = npu_device() if graph == "npu_aclgraph" else torch.device("cpu")
     make_checkpoint(
@@ -185,6 +186,7 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(
             tmp_path,
             device=device,
             mtp=mtp,
+            num_speculative_tokens=draft_count if mtp else None,
             cache_pages=16,
             prefill_chunk=64,
         )
@@ -338,8 +340,8 @@ def test_mtp_aclgraph_nonzero_states_and_scratch_isolation(
         tolerance = (
             dict(rtol=0, atol=0) if device_kind == "cpu" else dict(rtol=0.02, atol=1e-4)
         )
-        torch.testing.assert_close(actual[3], anchor[1], **tolerance)
-        torch.testing.assert_close(actual[4], anchor[2], **tolerance)
+        torch.testing.assert_close(actual[1][:, 0], anchor[1], **tolerance)
+        torch.testing.assert_close(actual[2][:, 0], anchor[2], **tolerance)
         torch.testing.assert_close(state.recurrent, original_rec, rtol=0, atol=0)
         torch.testing.assert_close(state.convolution, original_conv, rtol=0, atol=0)
         if saved is not None:
@@ -388,13 +390,18 @@ def test_mtp_npugraph_ex_rejected_before_loading_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["eager", "simulated_aclgraph", "npu_aclgraph"])
+@pytest.mark.parametrize("draft_count", [1, 3])
 @torch.inference_mode()
-def test_mtp_batch_verify_matches_independent_rows(tmp_path, monkeypatch, mode):
+def test_mtp_batch_verify_matches_independent_rows(
+    tmp_path, monkeypatch, mode, draft_count
+):
     device = npu_device() if mode == "npu_aclgraph" else torch.device("cpu")
     make_checkpoint(tmp_path, raw_config=NPU_CONFIG if device.type == "npu" else CONFIG)
     if mode == "simulated_aclgraph":
         install_cpu_graph(monkeypatch)
-    runner = QwenAscendRunner(tmp_path, device=device, mtp=True)
+    runner = QwenAscendRunner(
+        tmp_path, device=device, num_speculative_tokens=draft_count
+    )
     torch.manual_seed(29)
     for parameter in runner.model.parameters():
         parameter.normal_(0, 0.15)
@@ -422,23 +429,41 @@ def test_mtp_batch_verify_matches_independent_rows(tmp_path, monkeypatch, mode):
         state = runner._empty_state()
         state.recurrent.normal_(0, 0.1)
         state.convolution.normal_(0, 0.1)
-        rows.append((row, context, state, runner._long([5 + row, 7 + row])))
+        rows.append(
+            (
+                row,
+                context,
+                state,
+                runner._long(list(range(5 + row, 6 + row + draft_count))),
+            )
+        )
 
     short_row = (rows[0][0], 3, *rows[0][2:])
     for batch in (rows, list(reversed(rows)), rows[:1], [short_row, rows[1]]):
         ref_keys, ref_values = runner.keys.clone(), runner.values.clone()
         expected = []
         for row, context, state, ids in batch:
-            metadata = runner._page_table(group, row, context, context + 2)
-            expected.append(
-                runner.model.target(
-                    ids,
+            recurrent, convolution = state.recurrent, state.convolution
+            hidden_steps, recurrent_steps, conv_steps = [], [], []
+            for offset in range(len(ids)):
+                start = context + offset
+                metadata = runner._page_table(group, row, start, start + 1)
+                hidden, recurrent, convolution = runner.model.target(
+                    ids[offset : offset + 1],
                     *metadata,
-                    state.recurrent,
-                    state.convolution,
+                    recurrent,
+                    convolution,
                     ref_keys,
                     ref_values,
-                    verify=True,
+                )
+                hidden_steps.append(hidden)
+                recurrent_steps.append(recurrent)
+                conv_steps.append(convolution)
+            expected.append(
+                (
+                    torch.cat(hidden_steps),
+                    torch.stack(recurrent_steps, dim=1),
+                    torch.stack(conv_steps, dim=1),
                 )
             )
         hidden, *states = runner._verify_targets(group, batch)
@@ -470,15 +495,19 @@ def test_aclgraph_rejects_input_changes_before_copy(monkeypatch):
 
 @pytest.mark.parametrize("stop_on_eos", [False, True])
 @pytest.mark.parametrize("accept_draft", [False, True])
+@pytest.mark.parametrize("draft_count", [1, 3])
 def test_mtp_aclgraph_mixed_requests_stop_and_release(
-    tmp_path, monkeypatch, stop_on_eos, accept_draft
+    tmp_path, monkeypatch, stop_on_eos, accept_draft, draft_count
 ):
     make_checkpoint(tmp_path)
     install_cpu_graph(monkeypatch)
 
     def generate(graph):
         runner = QwenAscendRunner(
-            tmp_path, device=torch.device("cpu"), mtp=True, cache_pages=32
+            tmp_path,
+            device=torch.device("cpu"),
+            num_speculative_tokens=draft_count,
+            cache_pages=32,
         )
         with torch.no_grad():
             embedding = runner.model.text.embed_tokens.weight
@@ -538,7 +567,9 @@ def test_mtp_aclgraph_mixed_requests_stop_and_release(
             results.append(again.take_result())
             assert not runner.states
         assert runner.drafted > 0
-        assert runner.accepted == (runner.drafted - 1 if accept_draft else 0)
+        assert runner.drafted == runner.verify_rows * draft_count
+        # The token-5 rows accept draft 3, then reject any further proposal.
+        assert runner.accepted == (2 if accept_draft else 0)
         return results
 
     assert generate(True) == generate(False) == [[5, 3], [5, 3], [3, 3], [5, 3, 3]]
