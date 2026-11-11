@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -35,6 +36,25 @@ CONFIG = {
     "tie_word_embeddings": True,
 }
 
+NPU_CONFIG = {
+    **CONFIG,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "head_dim": 128,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+}
+
+
+def npu_device():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an Ascend NPU")
+    device = torch.device("npu", torch.npu.current_device())
+    torch.npu.set_device(device)
+    return device
+
 
 @pytest.mark.parametrize("dp,tp", [(1, 2), (2, 1), (2, 4)])
 def test_dense_runner_accepts_dp_and_tp_with_derived_expert_tp(dp, tp):
@@ -53,8 +73,8 @@ def test_dense_runner_rejects_cp_and_ep(axis):
         )
 
 
-def make_checkpoint(root, *, accept_draft=True, quantize=False):
-    config = Qwen35Config.from_hugging_face(CONFIG)
+def make_checkpoint(root, *, accept_draft=True, quantize=False, raw_config=CONFIG):
+    config = Qwen35Config.from_hugging_face(raw_config)
     model = QwenModel(config, TensorParallel(), mtp=True)
     with torch.no_grad():
         for weight in model.parameters():
@@ -65,7 +85,7 @@ def make_checkpoint(root, *, accept_draft=True, quantize=False):
         model.text.embed_tokens.weight[3, 0] = 3
         model.text.embed_tokens.weight[4, 1] = 3
         model.mtp.fc.weight[0 if accept_draft else 1, 0] = 1
-    (root / "config.json").write_text(json.dumps(CONFIG))
+    (root / "config.json").write_text(json.dumps(raw_config))
     tensors = {
         name: weight.to(torch.bfloat16) for name, weight in model.state_dict().items()
     }
@@ -114,10 +134,10 @@ def test_startup_aclgraph_captures_configured_buckets_before_decode(
     captured = []
 
     class EagerGraph:
-        def __init__(self, forward, inputs, *, mode):
+        def __init__(self, forward, inputs, *, mode, warmup_inputs):
             assert mode == "aclgraph"
             assert torch.is_inference_mode_enabled()
-            assert all(not tensor.count_nonzero() for tensor in inputs)
+            assert all(not tensor.count_nonzero() for tensor in warmup_inputs)
             captured.append(inputs[2].numel())
             self.forward = forward
 
@@ -147,17 +167,30 @@ def test_startup_aclgraph_captures_configured_buckets_before_decode(
 
 
 @pytest.mark.parametrize("accept_draft", [True, False])
-def test_mtp_matches_target_across_page_and_prefill_chunks(tmp_path, accept_draft):
-    make_checkpoint(tmp_path, accept_draft=accept_draft)
+@pytest.mark.parametrize("graph", ["eager", "simulated_aclgraph", "npu_aclgraph"])
+def test_mtp_matches_target_across_page_and_prefill_chunks(
+    tmp_path, monkeypatch, accept_draft, graph
+):
+    device = npu_device() if graph == "npu_aclgraph" else torch.device("cpu")
+    make_checkpoint(
+        tmp_path,
+        accept_draft=accept_draft,
+        raw_config=NPU_CONFIG if device.type == "npu" else CONFIG,
+    )
+    if graph == "simulated_aclgraph":
+        install_cpu_graph(monkeypatch)
 
     def generate(mtp):
         runner = QwenAscendRunner(
             tmp_path,
-            device=torch.device("cpu"),
+            device=device,
             mtp=mtp,
             cache_pages=16,
             prefill_chunk=64,
         )
+        if graph != "eager":
+            runner.graph_mode = "aclgraph"
+            runner.graph_capture_pages = (1, 2)
         with Engine(runner, context_length=256, enable_overlap=False) as engine:
             engine.submit(
                 [1] * 127,
@@ -170,6 +203,10 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(tmp_path, accept_draf
                     break
             tokens = [event.token_id for event in events]
             assert not runner.states
+        if graph != "eager" and mtp:
+            assert {kind for kind, _ in runner.graphs} == {"target", "verify", "draft"}
+            assert runner.graph_replays > 0
+            assert runner.graph_fallbacks == 0
         return tokens, runner.drafted, runner.accepted
 
     target, _, _ = generate(False)
@@ -177,6 +214,252 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(tmp_path, accept_draf
     assert mtp == target == [3] * 5
     assert drafted > 0
     assert accepted == (drafted if accept_draft else 0)
+
+
+def install_cpu_graph(monkeypatch):
+    """Keep static inputs/outputs to catch aliasing across rows and graph kinds."""
+
+    def capture(graph, forward, _device):
+        assert torch.is_inference_mode_enabled()
+        output = tuple(value.clone() for value in forward(*graph.inputs))
+
+        def replay():
+            for buffer, value in zip(output, forward(*graph.inputs), strict=True):
+                buffer.copy_(value)
+            return output
+
+        return replay
+
+    monkeypatch.setattr(DecodeGraph, "_capture", capture)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda _device: None), raising=False
+    )
+
+
+@pytest.mark.parametrize("capture_pages", [(1, 2), (1,), None])
+@pytest.mark.parametrize(
+    "device_kind,quantization", [("cpu", "bf16"), ("npu", "bf16"), ("npu", "w8a8")]
+)
+@torch.inference_mode()
+def test_mtp_aclgraph_nonzero_states_and_scratch_isolation(
+    tmp_path, monkeypatch, capture_pages, device_kind, quantization
+):
+    device = npu_device() if device_kind == "npu" else torch.device("cpu")
+    make_checkpoint(
+        tmp_path,
+        raw_config=NPU_CONFIG if device_kind == "npu" else CONFIG,
+        quantize=quantization == "w8a8",
+    )
+    if device_kind == "cpu":
+        install_cpu_graph(monkeypatch)
+    runner = QwenAscendRunner(
+        tmp_path, device=device, mtp=True, quantization=quantization
+    )
+    # Nonzero projections make recurrence rollback and stale output observable.
+    torch.manual_seed(17)
+    for parameter in runner.model.parameters():
+        parameter.normal_(0, 0.15)
+    if quantization == "w8a8":
+        qkv = runner.model.text.layers[0].linear_attn.in_proj_qkv
+        qkv.weight.copy_(
+            torch.randint(-5, 6, qkv.weight.shape, dtype=torch.int8).to(device)
+        )
+        qkv.weight_scale.fill_(0.03)
+    c = runner.model.config
+    shape = (4, 128, c.num_key_value_heads, c.head_dim)
+    runner.keys = torch.randn(
+        (c.full_layer_count, *shape), dtype=torch.bfloat16, device=device
+    )
+    runner.values = torch.randn_like(runner.keys)
+    runner.draft_keys = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    runner.draft_values = torch.randn_like(runner.draft_keys)
+    before = tuple(
+        tensor.clone()
+        for tensor in (
+            runner.keys,
+            runner.values,
+            runner.draft_keys,
+            runner.draft_values,
+        )
+    )
+    runner.graph_mode = "aclgraph"
+    runner.graph_capture_pages = capture_pages
+    if capture_pages is not None:
+        runner._capture_startup_graphs(capture_pages)
+        for actual, expected in zip(
+            (runner.keys, runner.values, runner.draft_keys, runner.draft_values), before
+        ):
+            # Warmup/replay can only change reserved physical page zero.
+            index = (
+                (slice(None), slice(1, None)) if actual.ndim == 5 else slice(1, None)
+            )
+            torch.testing.assert_close(actual[index], expected[index])
+        count = len(runner.graphs)
+
+    saved = None
+    for context, pages in [(3, [3]), (127, [3, 1]), (128, [1, 2]), (4, [2])]:
+        group = SimpleNamespace(block_slabs=lambda _row: np.array(pages))
+        state = runner._empty_state()
+        state.recurrent.normal_(0, 0.1)
+        state.convolution.normal_(0, 0.1)
+        state.hidden.normal_(0, 0.1)
+        original_rec, original_conv = state.recurrent.clone(), state.convolution.clone()
+        ids = torch.tensor([5, 7], device=device)
+        positions, table, slots = runner._page_table(group, 0, context, context + 2)
+        expected = runner.model.target(
+            ids,
+            positions,
+            table,
+            slots,
+            state.recurrent,
+            state.convolution,
+            runner.keys.clone(),
+            runner.values.clone(),
+            verify=True,
+        )
+        actual = runner._target(ids, group, 0, context, state, decode=True, verify=True)
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        # Rejection commits exactly the anchor's recurrent and convolution state.
+        anchor = runner.model.target(
+            ids[:1],
+            positions[:1],
+            table,
+            slots[:1],
+            state.recurrent,
+            state.convolution,
+            runner.keys.clone(),
+            runner.values.clone(),
+        )
+        tolerance = (
+            dict(rtol=0, atol=0) if device_kind == "cpu" else dict(rtol=0.02, atol=1e-4)
+        )
+        torch.testing.assert_close(actual[3], anchor[1], **tolerance)
+        torch.testing.assert_close(actual[4], anchor[2], **tolerance)
+        torch.testing.assert_close(state.recurrent, original_rec, rtol=0, atol=0)
+        torch.testing.assert_close(state.convolution, original_conv, rtol=0, atol=0)
+        if saved is not None:
+            for value, copy in zip(saved[0], saved[1]):
+                torch.testing.assert_close(value, copy, rtol=0, atol=0)
+        committed = tuple(value.clone() for value in actual)
+        saved = committed, tuple(value.clone() for value in committed)
+
+        for offset in (0, 1):
+            pos, table, slot = runner._page_table(
+                group, 0, context + offset, context + offset + 1
+            )
+            hidden = actual[0][offset : offset + 1]
+            expected_draft = runner.model.draft(
+                ids[offset : offset + 1],
+                hidden,
+                pos,
+                table,
+                slot,
+                runner.draft_keys.clone(),
+                runner.draft_values.clone(),
+            )
+            actual_draft = runner._draft(
+                ids[offset : offset + 1],
+                hidden,
+                group,
+                0,
+                context + offset,
+                decode=True,
+            )
+            torch.testing.assert_close(actual_draft, expected_draft, rtol=0, atol=0)
+        # Target-only decode remains available to non-greedy requests.
+        target = runner._target(ids[:1], group, 0, context, state, decode=True)
+        for result, reference in zip(target, anchor):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    if capture_pages is not None:
+        assert len(runner.graphs) == count
+    assert (runner.graph_fallbacks > 0) == (capture_pages == (1,))
+
+
+def test_mtp_npugraph_ex_rejected_before_loading_checkpoint(tmp_path):
+    with pytest.raises(ValueError, match="MTP graph execution requires"):
+        QwenAscendRunner(
+            tmp_path, device=SimpleNamespace(type="npu"), mtp=True, graph="npugraph_ex"
+        )
+
+
+@torch.inference_mode()
+def test_aclgraph_rejects_input_changes_before_copy(monkeypatch):
+    install_cpu_graph(monkeypatch)
+    graph = DecodeGraph(lambda x: (x + 1,), (torch.zeros(2),), mode="aclgraph")
+    for bad in ((torch.ones(1),), (torch.ones(2, dtype=torch.long),), ()):
+        with pytest.raises(ValueError, match="input shape, dtype, or device"):
+            graph.replay(bad)
+        assert not graph.inputs[0].count_nonzero()
+    (result,) = graph.replay((torch.tensor([2.0, 3.0]),))
+    torch.testing.assert_close(result, torch.tensor([3.0, 4.0]))
+
+
+@pytest.mark.parametrize("stop_on_eos", [False, True])
+@pytest.mark.parametrize("accept_draft", [False, True])
+def test_mtp_aclgraph_mixed_requests_stop_and_release(
+    tmp_path, monkeypatch, stop_on_eos, accept_draft
+):
+    make_checkpoint(tmp_path)
+    install_cpu_graph(monkeypatch)
+
+    def generate(graph):
+        runner = QwenAscendRunner(
+            tmp_path, device=torch.device("cpu"), mtp=True, cache_pages=32
+        )
+        with torch.no_grad():
+            embedding = runner.model.text.embed_tokens.weight
+            embedding.zero_()
+            # Target transitions 1 -> 5 -> 3, so EOS occurs during verify.
+            embedding[1, 0] = 1
+            embedding[5, :2] = torch.tensor([2.0, 1.0])
+            embedding[3, 1] = 6
+            runner.model.mtp.fc.weight.zero_()
+            runner.model.mtp.fc.weight[1 if accept_draft else 0, 0] = 1
+        if graph:
+            runner.graph_mode = "aclgraph"
+            runner.graph_capture_pages = (1, 2)
+        with Engine(
+            runner, context_length=256, max_running_requests=3, enable_overlap=False
+        ) as engine:
+            requests = [
+                engine.submit(
+                    [1] * length,
+                    sampling_params=SamplingParams(
+                        temperature=temperature,
+                        top_k=1,
+                        seed=7,
+                        max_output_tokens=8 if stop_on_eos else 2,
+                        stop_token_ids=[3] if stop_on_eos else [],
+                    ),
+                )
+                for length, temperature in [(127, 0), (3, 0), (4, 0.7)]
+            ]
+            engine.step()
+            assert all(not request.done for request in requests)
+            assert engine.cancel(requests[1])
+            for _ in range(8):
+                engine.step()
+                if requests[0].done and requests[2].done:
+                    break
+            results = [requests[i].take_result() for i in (0, 2)]
+            assert not runner.states
+            # Reusing the pool after cancellation/EOS must not reuse live state.
+            again = engine.submit(
+                [1] * 129,
+                sampling_params=SamplingParams(temperature=0, max_output_tokens=3),
+            )
+            for _ in range(8):
+                engine.step()
+                if again.done:
+                    break
+            results.append(again.take_result())
+            assert not runner.states
+        assert runner.drafted > 0
+        assert runner.accepted == (runner.drafted if accept_draft else 0)
+        return results
+
+    assert generate(True) == generate(False) == [[5, 3], [5, 3], [5, 3, 3]]
 
 
 def test_modelslim_qkv_tp_preserves_segment_and_scale_order(tmp_path):

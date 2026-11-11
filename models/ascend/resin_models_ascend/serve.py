@@ -60,10 +60,10 @@ def main(argv=None):
         or world > 8
     ):
         parser.error("launch a single node with DP × TP processes, up to eight ranks")
-    if args.graph != "eager" and (world != 1 or args.mtp or args.attention != "torch"):
-        parser.error(
-            f"{args.graph} requires one card, target-only decode and --attention torch"
-        )
+    if args.graph != "eager" and (world != 1 or args.attention != "torch"):
+        parser.error(f"{args.graph} requires one card and --attention torch")
+    if args.mtp and args.graph == "npugraph_ex":
+        parser.error("MTP graph execution requires --graph aclgraph")
     if args.graph_capture_pages is not None and args.graph != "aclgraph":
         parser.error("--graph-capture-pages requires --graph aclgraph")
     if (

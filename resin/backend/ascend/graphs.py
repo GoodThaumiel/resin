@@ -14,10 +14,24 @@ Decode = Callable[..., tuple[Tensor, ...]]
 
 
 class DecodeGraph:
-    def __init__(self, forward: Decode, inputs: tuple[Tensor, ...], *, mode: str):
+    def __init__(
+        self,
+        forward: Decode,
+        inputs: tuple[Tensor, ...],
+        *,
+        mode: str,
+        warmup_inputs: tuple[Tensor, ...] | None = None,
+    ):
         # All-zero metadata routes warmup writes to page zero, outside the
         # Engine's one-based physical pages. Replay stages the live metadata.
-        self.inputs = tuple(torch.zeros_like(value) for value in inputs)
+        # Multi-token verification must use distinct slots within scratch page
+        # zero: duplicate index_copy_ destinations are not deterministic.
+        self.inputs = (
+            tuple(torch.zeros_like(value) for value in inputs)
+            if warmup_inputs is None
+            else tuple(value.clone() for value in warmup_inputs)
+        )
+        self._validate(inputs)
         device = inputs[0].device
         if mode == "aclgraph":
             self._run = self._capture(forward, device)
@@ -63,6 +77,15 @@ class DecodeGraph:
         return lambda: compiled(*self.inputs)
 
     def replay(self, inputs: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        self._validate(inputs)
         for buffer, value in zip(self.inputs, inputs, strict=True):
             buffer.copy_(value)
         return self._run()
+
+    def _validate(self, inputs: tuple[Tensor, ...]) -> None:
+        if len(inputs) != len(self.inputs) or any(
+            (buffer.shape, buffer.dtype, buffer.device)
+            != (value.shape, value.dtype, value.device)
+            for buffer, value in zip(self.inputs, inputs)
+        ):
+            raise ValueError("decode graph input shape, dtype, or device changed")

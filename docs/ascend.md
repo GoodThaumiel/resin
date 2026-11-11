@@ -87,6 +87,59 @@ eager prefill and sampling. Capture writes to a reserved scratch page. Each
 replay updates the input buffers with the live token, position, page table,
 write slot, and recurrent state.
 
+### MTP with ACLGraph
+
+```bash
+resin-ascend-serve /models/Qwen3.5-4B --mtp --graph aclgraph \
+  --graph-capture-pages 1 2 4 8 --verbose
+```
+
+The checkpoint must include MTP weights. Greedy requests (`temperature=0`)
+use three distinct graph kinds: `target` for one-token target decode, `draft`
+for the one-token prediction head, and `verify` for the two-token target
+verification. Each configured page bucket captures all three at startup.
+Verification returns both the final state and the state after the anchor;
+rejection commits only the latter. Writes beyond the accepted prefix remain
+masked and are overwritten on subsequent execution. Live recurrent,
+convolution, and hidden states are copied before another row can replay the
+same graph. Warmup uses distinct slots 0 and 1 in the reserved page for verify.
+
+Logits projection, argmax, acceptance decisions, state commit, and prefill
+remain eager. Positive-temperature requests use target-only sampling and
+maintain the draft cache. MTP graphs require one NPU and tensor attention;
+`--mtp --graph npugraph_ex`, TP graphs, and native-attention graphs remain
+unsupported. BF16 and dynamic W8A8 use the same graph routing, but each
+precision requires independent validation on the target software stack.
+
+The graph bucket uses the whole context including the verification tokens.
+For example, verification at context 127 needs bucket 2, even though its
+anchor alone fits in bucket 1. Missing buckets fall back to eager for that
+operation, without runtime capture when startup buckets are configured.
+Graph startup memory increases because each bucket now holds three graphs.
+
+After rebuilding both packages, run the CPU and NPU tests on the server:
+
+```bash
+python3 -m pip install --no-deps --force-reinstall . ./models/ascend
+python3 -m pytest -q models/ascend/tests/test_qwen_ascend.py -k 'mtp or aclgraph'
+```
+
+NPU cases skip if TorchNPU or a device is unavailable. They cover actual
+capture/replay with changed tokens, page tables and recurrent state, scratch
+isolation, forced draft acceptance/rejection, and a KV page boundary. CPU
+cases emulate static graph output buffers to check lifetime and routing.
+Also compare the real checkpoint's greedy token IDs for target-only eager,
+MTP eager, and MTP ACLGraph, including concurrent requests, EOS and output
+limits, before measuring speed. A toy checkpoint test does not establish
+real-model accuracy or W8A8 compatibility.
+
+The buffer lifetime rules follow TorchAir's
+[graph memory documentation](https://gitcode.com/Ascend/torchair/blob/master/docs/zh/npugraph_ex/basic/memory_reuse.md).
+This implementation uses the existing raw TorchNPU `NPUGraph` API; it does not
+enable TorchAir graph-pool sharing between draft and verify.
+
+### Page buckets and validation
+
 With `--graph-capture-pages`, Resin captures and replays each listed bucket
 once on the scratch page before the HTTP listener starts. Sizes are powers of
 two in KV pages of 128 tokens. For example, `1 2 4 8` covers decode lengths

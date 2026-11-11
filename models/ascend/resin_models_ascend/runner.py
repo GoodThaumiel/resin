@@ -95,11 +95,13 @@ class QwenAscendRunner:
                 )
             capture_pages = tuple(sorted(set(graph_capture_pages)))
         if graph != "eager" and (
-            tp.size > 1 or mtp or device.type != "npu" or attention != "torch"
+            tp.size > 1 or device.type != "npu" or attention != "torch"
         ):
             raise ValueError(
-                f"{graph} requires single-card target-only decode with tensor attention"
+                f"{graph} requires single-card decode with tensor attention"
             )
+        if mtp and graph == "npugraph_ex":
+            raise ValueError("MTP graph execution requires graph='aclgraph'")
         if attention == "native" and device.type != "npu":
             raise ValueError("native attention requires an NPU")
         if native_gdn_prefill and device.type != "npu":
@@ -130,7 +132,7 @@ class QwenAscendRunner:
         self.graph_mode = graph
         self.graph_max_pages = graph_max_pages
         self.graph_capture_pages = capture_pages
-        self.graphs: dict[int, DecodeGraph] = {}
+        self.graphs: dict[tuple[str, int], DecodeGraph] = {}
         self.graph_replays = 0
         self.graph_fallbacks = 0
         self.drafted = self.accepted = 0
@@ -219,25 +221,47 @@ class QwenAscendRunner:
         )
 
     def _capture_graph(
-        self, bucket: int, inputs: tuple[Tensor, ...], *, startup: bool = False
+        self,
+        kind: str,
+        bucket: int,
+        inputs: tuple[Tensor, ...],
+        *,
+        startup: bool = False,
     ) -> DecodeGraph:
         def forward(*args):
-            return self.model.target(*args, self.keys, self.values)
+            if kind == "draft":
+                return (self.model.draft(*args, self.draft_keys, self.draft_values),)
+            return self.model.target(
+                *args, self.keys, self.values, verify=kind == "verify"
+            )
+
+        scratch = [torch.zeros_like(value) for value in inputs]
+        # Target inputs: ids, positions, pages, slots, recurrent, convolution.
+        # Draft inputs: ids, previous hidden, positions, pages, slots.
+        position_index, slot_index = (2, 4) if kind == "draft" else (1, 3)
+        positions = torch.arange(inputs[0].numel(), device=self.device)
+        scratch[position_index].copy_(positions)
+        scratch[slot_index].copy_(positions)
+        scratch = tuple(scratch)
 
         stage = "startup" if startup else "request"
         log.info(
-            "Capturing Ascend decode graph, mode=%s, page bucket=%d, stage=%s",
+            "Capturing Ascend decode graph, mode=%s, kind=%s, page bucket=%d, stage=%s",
             self.graph_mode,
+            kind,
             bucket,
             stage,
         )
-        graph = DecodeGraph(forward, inputs, mode=self.graph_mode)
+        graph = DecodeGraph(
+            forward, inputs, mode=self.graph_mode, warmup_inputs=scratch
+        )
         if startup:
-            graph.replay(inputs)
+            graph.replay(scratch)
             torch.npu.synchronize(self.device)
         log.info(
-            "Ascend decode graph captured, mode=%s, page bucket=%d, stage=%s",
+            "Ascend decode graph captured, mode=%s, kind=%s, page bucket=%d, stage=%s",
             self.graph_mode,
+            kind,
             bucket,
             stage,
         )
@@ -246,38 +270,57 @@ class QwenAscendRunner:
     @torch.inference_mode()
     def _capture_startup_graphs(self, buckets: tuple[int, ...]) -> None:
         state = self._empty_state()
-        zero = self._long([0])
-        # Page and slot zero are reserved for warmup and startup replay.
-        self.graphs = {
-            bucket: self._capture_graph(
-                bucket,
-                (
-                    zero,
-                    zero,
-                    zero.new_zeros((bucket,)),
-                    zero,
-                    state.recurrent,
-                    state.convolution,
-                ),
-                startup=True,
-            )
-            for bucket in buckets
-        }
+        kinds = ("target", "verify", "draft") if self.mtp else ("target",)
+        for bucket in buckets:
+            for kind in kinds:
+                zero = self._long([0, 0] if kind == "verify" else [0])
+                pages = zero.new_zeros((bucket,))
+                inputs = (
+                    (zero, state.hidden, zero, pages, zero)
+                    if kind == "draft"
+                    else (zero, zero, pages, zero, state.recurrent, state.convolution)
+                )
+                self.graphs[kind, bucket] = self._capture_graph(
+                    kind, bucket, inputs, startup=True
+                )
 
-    def _target(self, ids, group, row, context, state, *, decode=False, verify=False):
-        length = context + len(ids)
-        pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
-        bucket = 1 << (pages - 1).bit_length()
-        eligible = (
-            self.graph_mode != "eager" and decode and not verify and len(ids) == 1
-        )
-        graph = self.graphs.get(bucket) if eligible else None
+    def _graph_route(self, kind: str, bucket: int, eligible: bool):
+        graph = self.graphs.get((kind, bucket)) if eligible else None
         lazy_capture = (
             eligible
             and graph is None
             and self.graph_capture_pages is None
             and bucket <= self.graph_max_pages
         )
+        return graph, lazy_capture
+
+    def _replay_graph(self, graph: DecodeGraph, inputs, kind: str, bucket: int):
+        result = graph.replay(inputs)
+        self.graph_replays += 1
+        log.debug(
+            "Ascend decode graph replay, mode=%s, kind=%s, page bucket=%d",
+            self.graph_mode,
+            kind,
+            bucket,
+        )
+        return result
+
+    def _graph_fallback(self, kind: str, bucket: int) -> None:
+        self.graph_fallbacks += 1
+        log.debug("Ascend decode graph fallback, kind=%s, page bucket=%d", kind, bucket)
+
+    def _target(self, ids, group, row, context, state, *, decode=False, verify=False):
+        length = context + len(ids)
+        pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
+        bucket = 1 << (pages - 1).bit_length()
+        eligible = (
+            self.graph_mode != "eager"
+            and decode
+            and len(ids) == (2 if verify else 1)
+            and (not verify or self.graph_mode == "aclgraph")
+        )
+        kind = "verify" if verify else "target"
+        graph, lazy_capture = self._graph_route(kind, bucket, eligible)
         positions, page_table, slots = self._page_table(
             group,
             row,
@@ -287,19 +330,13 @@ class QwenAscendRunner:
         )
         inputs = (ids, positions, page_table, slots, state.recurrent, state.convolution)
         if lazy_capture:
-            graph = self.graphs[bucket] = self._capture_graph(bucket, inputs)
-        if graph is not None:
-            result = graph.replay(inputs)
-            self.graph_replays += 1
-            log.debug(
-                "Ascend decode graph replay, mode=%s, page bucket=%d",
-                self.graph_mode,
-                bucket,
+            graph = self.graphs[kind, bucket] = self._capture_graph(
+                kind, bucket, inputs
             )
-            return result
+        if graph is not None:
+            return self._replay_graph(graph, inputs, kind, bucket)
         if eligible:
-            self.graph_fallbacks += 1
-            log.debug("Ascend decode graph fallback, page bucket=%d", bucket)
+            self._graph_fallback(kind, bucket)
         return self.model.target(
             *inputs,
             self.keys,
@@ -310,11 +347,29 @@ class QwenAscendRunner:
             native_prefill=self.native_gdn_prefill and not decode,
         )
 
-    def _draft(self, ids, hidden, group, row, start):
-        positions, pages, slots = self._page_table(group, row, start, start + len(ids))
-        return self.model.draft(
-            ids, hidden, positions, pages, slots, self.draft_keys, self.draft_values
+    def _draft(self, ids, hidden, group, row, start, *, decode=False):
+        length = start + len(ids)
+        pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
+        bucket = 1 << (pages - 1).bit_length()
+        eligible = self.graph_mode == "aclgraph" and decode and len(ids) == 1
+        graph, lazy_capture = self._graph_route("draft", bucket, eligible)
+        positions, pages, slots = self._page_table(
+            group,
+            row,
+            start,
+            length,
+            bucket=bucket if graph is not None or lazy_capture else 0,
         )
+        inputs = (ids, hidden, positions, pages, slots)
+        if lazy_capture:
+            graph = self.graphs["draft", bucket] = self._capture_graph(
+                "draft", bucket, inputs
+            )
+        if graph is not None:
+            return self._replay_graph(graph, inputs, "draft", bucket)[0]
+        if eligible:
+            self._graph_fallback("draft", bucket)
+        return self.model.draft(*inputs, self.draft_keys, self.draft_values)
 
     def _prepare(self, plan: BatchPlan) -> PagedCachePlan:
         if self.binding.pool_id is None:
@@ -368,7 +423,7 @@ class QwenAscendRunner:
             )
             if spec:
                 draft_hidden = self._draft(
-                    ids, state.hidden, cache.groups[MTP], row, context
+                    ids, state.hidden, cache.groups[MTP], row, context, decode=True
                 )
                 draft = self.model.logits(draft_hidden).argmax(dim=-1)
                 verify_ids = torch.cat((ids, draft))
@@ -387,7 +442,14 @@ class QwenAscendRunner:
                 self.drafted += 1
                 self.accepted += int(accepted)
                 if accepted:
-                    self._draft(draft, hidden[:1], cache.groups[MTP], row, context + 1)
+                    self._draft(
+                        draft,
+                        hidden[:1],
+                        cache.groups[MTP],
+                        row,
+                        context + 1,
+                        decode=True,
+                    )
                 else:
                     recurrent, convolution = first_rec, first_conv
                 last_hidden = hidden[int(accepted) : int(accepted) + 1]
@@ -414,7 +476,14 @@ class QwenAscendRunner:
                     skip = int(context == 0)
                     if len(ids) > skip:
                         previous = torch.cat((state.hidden, hidden[:-1]))[skip:]
-                        self._draft(ids[skip:], previous, group, row, context + skip)
+                        self._draft(
+                            ids[skip:],
+                            previous,
+                            group,
+                            row,
+                            context + skip,
+                            decode=decode,
+                        )
                 if plan.needs_prompt_logprobs:
                     # Shared scoring kernels use the CPU compiler here.
                     def project_for_scores(selected: Tensor) -> Tensor:
