@@ -266,20 +266,29 @@ def smoke(torch, npu, name, device):
         decay = torch.zeros((tokens, 1), dtype=torch.float32, device=device)
         kwargs = dict(beta=beta, scale=128**-0.5, actual_seq_lengths=lengths, g=decay)
         if tokens == 1:
+            # Use the documented recurrent ACLNN input range. With zero
+            # initial state and one-hot q/k/v, the state update is beta * v kᵀ.
+            beta.fill_(0.5)
+            decay.fill_(-0.125)
             output = require(npu, "npu_recurrent_gated_delta_rule")(
                 q,
                 q,
                 q,
                 state,
                 ssm_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+                num_accepted_tokens=lengths,
                 **kwargs,
             )
+            check(torch, output, q * (0.5 * 128**-0.5), atol=0.002)
+            expected_state = torch.zeros_like(state, device="cpu")
+            expected_state[0, 0, 0, 0] = 0.5
+            check(torch, state, expected_state)
         else:
             output, state = require(npu, "npu_chunk_gated_delta_rule")(
                 q, q, q, initial_state=state, **kwargs
             )
-        check(torch, output, q * (128**-0.5), atol=0.002)
-        check(torch, state[0, 0, :1, :], q[:1, 0])
+            check(torch, output, q * (128**-0.5), atol=0.002)
+            check(torch, state[0, 0, :1, :], q[:1, 0])
     elif name == "w8a8":
         x = torch.ones((16, 128), device=device, dtype=dtype)
         quant, scales = require(npu, "npu_dynamic_quant")(x, dst_type=torch.int8)
@@ -415,6 +424,12 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--hccl-ranks", type=int, choices=(0, 2, 4, 8), default=0)
     parser.add_argument(
+        "--check",
+        choices=(*CHECKS, "hccl"),
+        action="append",
+        help="run only the selected check (repeat to select more than one)",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=120, help="seconds per runtime check"
     )
     parser.add_argument("--worker", choices=(*CHECKS, "hccl"), help=argparse.SUPPRESS)
@@ -424,8 +439,11 @@ def main():
     if args.worker:
         worker(args.worker, args.device, args.hccl_ranks)
         return 0
+    if args.check and "hccl" in args.check and not args.hccl_ranks:
+        parser.error("--check hccl requires --hccl-ranks")
     report = {"schema_version": 1, "inventory": inventory(args.timeout), "checks": {}}
-    names = (*CHECKS, "hccl") if args.hccl_ranks else CHECKS
+    default_names = (*CHECKS, "hccl") if args.hccl_ranks else CHECKS
+    names = tuple(dict.fromkeys(args.check)) if args.check else default_names
     for name in names:
         result = run_command(
             [
@@ -464,7 +482,11 @@ def main():
         print(f"{name}: {result['status']}", file=sys.stderr, flush=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Report: {args.output}")
-    required = ("device", "bf16_stream", *(("hccl",) if args.hccl_ranks else ()))
+    required = (
+        names
+        if args.check
+        else ("device", "bf16_stream", *(("hccl",) if args.hccl_ranks else ()))
+    )
     return int(any(report["checks"][name]["status"] != "pass" for name in required))
 
 

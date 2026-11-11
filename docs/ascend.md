@@ -6,8 +6,11 @@ local checkpoint directory for weights, config, and tokenizer.
 
 ## Check the host
 
-Activate the server's CANN 9.2.0 and TorchNPU environment first. From a Resin
-checkout, run the standalone probe with that environment's Python:
+Activate the server's CANN and TorchNPU environment first. The first host
+probe used CANN and Ops 9.1.0, Torch 2.10.0+cpu, TorchNPU 2.10.0.post4,
+and eight Ascend 910B4 devices. It passed the elementary `npugraph_ex`
+check using the backend shipped with TorchNPU. Run the standalone probe
+with the active environment's Python:
 
 ```bash
 python3 scripts/probe_ascend.py --output ascend-probe.json
@@ -18,13 +21,21 @@ The JSON includes package versions, device inventory, and a result for each
 operator, graph backend, and HCCL test. Review it before sharing. The script
 writes its report even when a required check fails and then exits nonzero.
 Use `--device` to select the first visible NPU and `--timeout` to extend the
-per-check timeout.
+per-check timeout. To rerun only recurrent GDN:
+
+```bash
+python3 scripts/probe_ascend.py --check gdn_recurrent --output ascend-probe-gdn.json
+```
 
 The repository's core package currently declares `torch>=2.13.0`. On a server
 whose CANN stack provides Torch 2.10, preserve that installed Torch/TorchNPU
 pair for bring-up. The explicit source-install procedure below bypasses normal
 dependency resolution for the local Resin packages. It requires Python 3.11+
-and a Rust toolchain to build the extension.
+and a Rust toolchain to build the extension. Make sure both `rustc --version`
+and `cargo --version` work in the shell. The probe checks whether they are
+on `PATH`. The build installs Maturin into its isolated build environment.
+If Rust is missing, install the stable toolchain using the
+[Rust installation guide](https://rust-lang.org/install).
 
 ```bash
 python3 -m pip install 'blake3>=1,<2' 'numpy>=1.26,<3' 'safetensors>=0.5' 'transformers>=5.14.1'
@@ -76,9 +87,8 @@ python3 scripts/stress_http.py http://127.0.0.1:8000 \
   --model qwen-ascend --concurrency 1 4 --requests 16 --output ascend-http.json
 ```
 
-Start with BF16 single-card eager, then run ModelSlim W8A8, TP2, TP4, DP2, and
-DP2×TP4. Compare greedy MTP against target-only on the same precision and
-topology. The native operator call sites are based on
+Start with BF16 single-card eager, then compare eager native attention and
+native GDN prefill individually. Next run single-card graph decode, ModelSlim
+W8A8, TP2, TP4, DP2, and DP2×TP4. Compare greedy MTP against target-only on
+the same precision and topology. The native operator call sites are based on
 [vllm-ascend v0.30.0](https://github.com/vllm-project/vllm-ascend/tree/v0.30.0).
-The first host report determines which optional GDN kernels and which
-TorchNPU/CANN combinations can be qualified.
