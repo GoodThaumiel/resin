@@ -47,7 +47,11 @@ class LiveState:
 
 
 class QwenAscendRunner:
-    parallelism_capabilities = ParallelismCapabilities(attn_dp=True, attn_tp=True)
+    # With ep=1, Parallelism still derives expert_tp from the full world.
+    # Dense Qwen shards its FFNs on the attention TP group within each replica.
+    parallelism_capabilities = ParallelismCapabilities(
+        attn_dp=True, attn_tp=True, expert_tp=True
+    )
 
     def __init__(
         self,

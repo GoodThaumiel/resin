@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from resin import Engine, SamplingParams
+from resin import Engine, Parallelism, SamplingParams
 from resin.backend.ascend.ops import DynamicInt8Linear, tensor_attention
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_ascend.checkpoint import load_model, shard_tensor
@@ -31,6 +31,23 @@ CONFIG = {
     "layer_types": ["linear_attention", "full_attention"],
     "tie_word_embeddings": True,
 }
+
+
+@pytest.mark.parametrize("dp,tp", [(1, 2), (2, 1), (2, 4)])
+def test_dense_runner_accepts_dp_and_tp_with_derived_expert_tp(dp, tp):
+    topology = Parallelism(world_size=dp * tp, attn_dp=dp, attn_tp=tp)
+    QwenAscendRunner.parallelism_capabilities.validate(
+        topology, model=QwenAscendRunner.__name__
+    )
+
+
+@pytest.mark.parametrize("axis", ["cp", "ep"])
+def test_dense_runner_rejects_cp_and_ep(axis):
+    topology = Parallelism(world_size=2, **{axis: 2})
+    with pytest.raises(ValueError, match=f"does not support {axis}=2"):
+        QwenAscendRunner.parallelism_capabilities.validate(
+            topology, model=QwenAscendRunner.__name__
+        )
 
 
 def make_checkpoint(root, *, accept_draft=True, quantize=False):
