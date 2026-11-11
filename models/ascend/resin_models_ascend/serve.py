@@ -46,6 +46,12 @@ def main(argv=None):
         nargs="+",
         help="pre-capture these KV page buckets before serving with --graph aclgraph",
     )
+    parser.add_argument(
+        "--graph-verify-batches",
+        type=int,
+        nargs="+",
+        help="also pre-capture MTP verify graphs for these exact request counts",
+    )
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -66,6 +72,10 @@ def main(argv=None):
         parser.error("MTP graph execution requires --graph aclgraph")
     if args.graph_capture_pages is not None and args.graph != "aclgraph":
         parser.error("--graph-capture-pages requires --graph aclgraph")
+    if args.graph_verify_batches is not None and (
+        not args.mtp or args.graph_capture_pages is None
+    ):
+        parser.error("--graph-verify-batches requires --mtp and --graph-capture-pages")
     if (
         min(
             args.context_length,
@@ -104,6 +114,7 @@ def main(argv=None):
                 graph=args.graph,
                 graph_max_pages=args.graph_max_pages,
                 graph_capture_pages=args.graph_capture_pages,
+                graph_verify_batches=args.graph_verify_batches,
                 attention=args.attention,
                 native_gdn_prefill=args.native_gdn_prefill,
             )

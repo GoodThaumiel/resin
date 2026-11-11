@@ -64,6 +64,7 @@ class QwenAscendRunner:
         prefill_chunk: int = 256,
         graph_max_pages: int = 32,
         graph_capture_pages: Sequence[int] | None = None,
+        graph_verify_batches: Sequence[int] | None = None,
         mtp: bool = False,
         quantization: str = "bf16",
         graph: str = "eager",
@@ -94,6 +95,18 @@ class QwenAscendRunner:
                     "up to graph_max_pages"
                 )
             capture_pages = tuple(sorted(set(graph_capture_pages)))
+        if graph_verify_batches is not None:
+            if not mtp or capture_pages is None:
+                raise ValueError(
+                    "graph_verify_batches requires MTP and startup capture"
+                )
+            if not graph_verify_batches or any(
+                type(size) is not int or not 1 <= size <= PAGE_TOKENS // 2
+                for size in graph_verify_batches
+            ):
+                raise ValueError(
+                    f"verify batch sizes must be in [1, {PAGE_TOKENS // 2}]"
+                )
         if graph != "eager" and (
             tp.size > 1 or device.type != "npu" or attention != "torch"
         ):
@@ -132,7 +145,8 @@ class QwenAscendRunner:
         self.graph_mode = graph
         self.graph_max_pages = graph_max_pages
         self.graph_capture_pages = capture_pages
-        self.graphs: dict[tuple[str, int], DecodeGraph] = {}
+        self.graph_verify_batches = tuple(sorted({1, *(graph_verify_batches or ())}))
+        self.graphs: dict[tuple[str, int, int], DecodeGraph] = {}
         self.graph_replays = 0
         self.graph_fallbacks = 0
         self.drafted = self.accepted = 0
@@ -197,6 +211,25 @@ class QwenAscendRunner:
         # Native BatchPlan NumPy views are read-only.
         return torch.tensor(value, dtype=torch.long, device=self.device)
 
+    @staticmethod
+    def _page_metadata(
+        group: CacheGroupView,
+        row: int,
+        start: int,
+        length: int,
+        *,
+        bucket: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        pages = group.block_slabs(row)[: (length + PAGE_TOKENS - 1) // PAGE_TOKENS]
+        positions = np.arange(start, length, dtype=np.int64)
+        slots = (
+            pages[positions // PAGE_TOKENS].astype(np.int64) * PAGE_TOKENS
+            + positions % PAGE_TOKENS
+        )
+        if bucket > len(pages):
+            pages = np.pad(pages, (0, bucket - len(pages)))
+        return positions, pages.astype(np.int64), slots
+
     def _page_table(
         self,
         group: CacheGroupView,
@@ -206,19 +239,10 @@ class QwenAscendRunner:
         *,
         bucket: int = 0,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        pages = group.block_slabs(row)[: (length + PAGE_TOKENS - 1) // PAGE_TOKENS]
-        positions = np.arange(start, length, dtype=np.int64)
-        slots = (
-            pages[positions // PAGE_TOKENS].astype(np.int64) * PAGE_TOKENS
-            + positions % PAGE_TOKENS
+        positions, pages, slots = self._page_metadata(
+            group, row, start, length, bucket=bucket
         )
-        if bucket > len(pages):
-            pages = np.pad(pages, (0, bucket - len(pages)))
-        return (
-            self._long(positions),
-            self._long(pages.astype(np.int64)),
-            self._long(slots),
-        )
+        return self._long(positions), self._long(pages), self._long(slots)
 
     def _capture_graph(
         self,
@@ -239,17 +263,21 @@ class QwenAscendRunner:
         # Target inputs: ids, positions, pages, slots, recurrent, convolution.
         # Draft inputs: ids, previous hidden, positions, pages, slots.
         position_index, slot_index = (2, 4) if kind == "draft" else (1, 3)
-        positions = torch.arange(inputs[0].numel(), device=self.device)
+        positions = torch.arange(inputs[0].numel(), device=self.device).reshape_as(
+            inputs[0]
+        )
         scratch[position_index].copy_(positions)
         scratch[slot_index].copy_(positions)
         scratch = tuple(scratch)
 
         stage = "startup" if startup else "request"
+        batch_size = inputs[0].shape[0] if inputs[0].ndim == 2 else 1
         log.info(
-            "Capturing Ascend decode graph, mode=%s, kind=%s, page bucket=%d, stage=%s",
+            "Capturing Ascend decode graph, mode=%s, kind=%s, page bucket=%d, batch=%d, stage=%s",
             self.graph_mode,
             kind,
             bucket,
+            batch_size,
             stage,
         )
         graph = DecodeGraph(
@@ -259,10 +287,11 @@ class QwenAscendRunner:
             graph.replay(scratch)
             torch.npu.synchronize(self.device)
         log.info(
-            "Ascend decode graph captured, mode=%s, kind=%s, page bucket=%d, stage=%s",
+            "Ascend decode graph captured, mode=%s, kind=%s, page bucket=%d, batch=%d, stage=%s",
             self.graph_mode,
             kind,
             bucket,
+            batch_size,
             stage,
         )
         return graph
@@ -280,12 +309,28 @@ class QwenAscendRunner:
                     if kind == "draft"
                     else (zero, zero, pages, zero, state.recurrent, state.convolution)
                 )
-                self.graphs[kind, bucket] = self._capture_graph(
+                self.graphs[kind, bucket, 1] = self._capture_graph(
                     kind, bucket, inputs, startup=True
                 )
+            if self.mtp:
+                for size in self.graph_verify_batches:
+                    if size == 1:
+                        continue
+                    ids = self._long(np.zeros((size, 2), dtype=np.int64))
+                    inputs = (
+                        ids,
+                        ids,
+                        ids.new_zeros((size, bucket)),
+                        ids,
+                        state.recurrent[:, None].expand(-1, size, -1, -1, -1),
+                        state.convolution[:, None].expand(-1, size, -1, -1),
+                    )
+                    self.graphs["verify", bucket, size] = self._capture_graph(
+                        "verify", bucket, inputs, startup=True
+                    )
 
     def _graph_route(self, kind: str, bucket: int, eligible: bool):
-        graph = self.graphs.get((kind, bucket)) if eligible else None
+        graph = self.graphs.get((kind, bucket, 1)) if eligible else None
         lazy_capture = (
             eligible
             and graph is None
@@ -294,20 +339,28 @@ class QwenAscendRunner:
         )
         return graph, lazy_capture
 
-    def _replay_graph(self, graph: DecodeGraph, inputs, kind: str, bucket: int):
+    def _replay_graph(
+        self, graph: DecodeGraph, inputs, kind: str, bucket: int, batch_size: int = 1
+    ):
         result = graph.replay(inputs)
         self.graph_replays += 1
         log.debug(
-            "Ascend decode graph replay, mode=%s, kind=%s, page bucket=%d",
+            "Ascend decode graph replay, mode=%s, kind=%s, page bucket=%d, batch=%d",
             self.graph_mode,
             kind,
             bucket,
+            batch_size,
         )
         return result
 
-    def _graph_fallback(self, kind: str, bucket: int) -> None:
+    def _graph_fallback(self, kind: str, bucket: int, batch_size: int = 1) -> None:
         self.graph_fallbacks += 1
-        log.debug("Ascend decode graph fallback, kind=%s, page bucket=%d", kind, bucket)
+        log.debug(
+            "Ascend decode graph fallback, kind=%s, page bucket=%d, batch=%d",
+            kind,
+            bucket,
+            batch_size,
+        )
 
     def _target(self, ids, group, row, context, state, *, decode=False, verify=False):
         length = context + len(ids)
@@ -330,7 +383,7 @@ class QwenAscendRunner:
         )
         inputs = (ids, positions, page_table, slots, state.recurrent, state.convolution)
         if lazy_capture:
-            graph = self.graphs[kind, bucket] = self._capture_graph(
+            graph = self.graphs[kind, bucket, 1] = self._capture_graph(
                 kind, bucket, inputs
             )
         if graph is not None:
@@ -362,7 +415,7 @@ class QwenAscendRunner:
         )
         inputs = (ids, hidden, positions, pages, slots)
         if lazy_capture:
-            graph = self.graphs["draft", bucket] = self._capture_graph(
+            graph = self.graphs["draft", bucket, 1] = self._capture_graph(
                 "draft", bucket, inputs
             )
         if graph is not None:
@@ -370,6 +423,105 @@ class QwenAscendRunner:
         if eligible:
             self._graph_fallback("draft", bucket)
         return self.model.draft(*inputs, self.draft_keys, self.draft_values)
+
+    def _verify_targets(self, group, rows):
+        batch_size = len(rows)
+        if batch_size == 1:
+            row, context, state, ids = rows[0]
+            hidden, *states = self._target(
+                ids, group, row, context, state, decode=True, verify=True
+            )
+            return hidden[None], *(tensor[:, None] for tensor in states)
+        if self.native is not None:
+            # The native attention path currently takes a single host length.
+            results = [
+                self._target(ids, group, row, context, state, decode=True, verify=True)
+                for row, context, state, ids in rows
+            ]
+            hidden, *states = zip(*results, strict=True)
+            return torch.stack(hidden), *(torch.stack(items, dim=1) for items in states)
+
+        pages = max(
+            (context + 2 + PAGE_TOKENS - 1) // PAGE_TOKENS for _, context, _, _ in rows
+        )
+        bucket = 1 << (pages - 1).bit_length()
+        graph = self.graphs.get(("verify", bucket, batch_size))
+        metadata = [
+            self._page_metadata(
+                group, row, context, context + 2, bucket=bucket if graph else pages
+            )
+            for row, context, _, _ in rows
+        ]
+        positions, page_table, slots = (
+            self._long(np.stack(items)) for items in zip(*metadata, strict=True)
+        )
+        inputs = (
+            torch.stack([ids for _, _, _, ids in rows]),
+            positions,
+            page_table,
+            slots,
+            torch.stack([state.recurrent for _, _, state, _ in rows], dim=1),
+            torch.stack([state.convolution for _, _, state, _ in rows], dim=1),
+        )
+        if graph is not None:
+            return self._replay_graph(graph, inputs, "verify", bucket, batch_size)
+        if self.graph_mode == "aclgraph":
+            self._graph_fallback("verify", bucket, batch_size)
+        return self.model.target(*inputs, self.keys, self.values, verify=True)
+
+    def _verify_rows(self, plan, cache, policies):
+        rows = []
+        drafts = []
+        for row, sequence in enumerate(plan.sequence_ids):
+            context = int(plan.context_lengths[row])
+            if not context or policies[row].temperature != 0:
+                continue
+            start, end = plan.token_range(row)
+            ids = self._long(cache.batch.token_ids[start:end].astype(np.int64))
+            state = self.states[int(sequence)][1]
+            draft_hidden = self._draft(
+                ids, state.hidden, cache.groups[MTP], row, context, decode=True
+            )
+            draft = self.model.logits(draft_hidden).argmax(dim=-1)
+            drafts.append(draft)
+            rows.append((row, context, state, torch.cat((ids, draft))))
+        if not rows:
+            return {}
+
+        hidden, recurrent, convolution, first_rec, first_conv = self._verify_targets(
+            cache.groups[TARGET], rows
+        )
+        scores = self.model.logits(hidden.flatten(0, 1)).unflatten(0, hidden.shape[:2])
+        decisions = torch.cat(
+            (scores.argmax(dim=-1), torch.stack(drafts)), dim=1
+        ).tolist()
+        results = {}
+        for index, ((row, context, _, _), (first, second, draft_id)) in enumerate(
+            zip(rows, decisions, strict=True)
+        ):
+            accepted = first == draft_id
+            self.drafted += 1
+            self.accepted += int(accepted)
+            if accepted:
+                self._draft(
+                    drafts[index],
+                    hidden[index, :1],
+                    cache.groups[MTP],
+                    row,
+                    context + 1,
+                    decode=True,
+                )
+            advance = int(accepted)
+            results[row] = (
+                scores[index],
+                [first, second] if accepted else [first],
+                LiveState(
+                    recurrent[:, index] if accepted else first_rec[:, index],
+                    convolution[:, index] if accepted else first_conv[:, index],
+                    hidden[index, advance : advance + 1],
+                ),
+            )
+        return results
 
     def _prepare(self, plan: BatchPlan) -> PagedCachePlan:
         if self.binding.pool_id is None:
@@ -412,88 +564,69 @@ class QwenAscendRunner:
         states = []
         decode = plan.phase == BatchPhase.DECODE
         policies = plan.sampling_params
+        verified = (
+            self._verify_rows(plan, cache, policies) if self.mtp and decode else {}
+        )
         for row, sequence_id in enumerate(plan.sequence_ids):
             sequence = int(sequence_id)
+            if row in verified:
+                scores, tokens, state = verified[row]
+                logits.append(scores)
+                output_rows.append(tokens)
+                states.append(
+                    (
+                        sequence,
+                        int(cache.groups[STATE].block_slabs(row)[0]),
+                        LiveState(
+                            state.recurrent.clone(),
+                            state.convolution.clone(),
+                            state.hidden.clone(),
+                        ),
+                    )
+                )
+                continue
             start, end = plan.token_range(row)
             ids = self._long(cache.batch.token_ids[start:end].astype(np.int64))
             context = int(plan.context_lengths[row])
             state = self.states[sequence][1] if context else self._empty_state()
-            spec = (
-                self.mtp and decode and context > 0 and policies[row].temperature == 0
+            hidden, recurrent, convolution = self._target(
+                ids,
+                cache.groups[TARGET],
+                row,
+                context,
+                state,
+                decode=decode,
             )
-            if spec:
-                draft_hidden = self._draft(
-                    ids, state.hidden, cache.groups[MTP], row, context, decode=True
-                )
-                draft = self.model.logits(draft_hidden).argmax(dim=-1)
-                verify_ids = torch.cat((ids, draft))
-                hidden, recurrent, convolution, first_rec, first_conv = self._target(
-                    verify_ids,
-                    cache.groups[TARGET],
-                    row,
-                    context,
-                    state,
-                    decode=True,
-                    verify=True,
-                )
-                scores = self.model.logits(hidden)
-                targets = scores.argmax(dim=-1).tolist()
-                accepted = targets[0] == int(draft.item())
-                self.drafted += 1
-                self.accepted += int(accepted)
-                if accepted:
+            last_hidden = hidden[-1:]
+            logits.append(self.model.logits(last_hidden))
+            output_rows.append([])
+            if self.mtp:
+                group = cache.groups[MTP]
+                if not context:
+                    first_page = int(group.block_slabs(row)[0])
+                    self.draft_keys[first_page, 0].zero_()
+                    self.draft_values[first_page, 0].zero_()
+                skip = int(context == 0)
+                if len(ids) > skip:
+                    previous = torch.cat((state.hidden, hidden[:-1]))[skip:]
                     self._draft(
-                        draft,
-                        hidden[:1],
-                        cache.groups[MTP],
+                        ids[skip:],
+                        previous,
+                        group,
                         row,
-                        context + 1,
-                        decode=True,
+                        context + skip,
+                        decode=decode,
                     )
-                else:
-                    recurrent, convolution = first_rec, first_conv
-                last_hidden = hidden[int(accepted) : int(accepted) + 1]
-                output_rows.append(targets[: 1 + int(accepted)])
-                logits.append(scores)
-            else:
-                hidden, recurrent, convolution = self._target(
-                    ids,
-                    cache.groups[TARGET],
-                    row,
-                    context,
-                    state,
-                    decode=decode,
-                )
-                last_hidden = hidden[-1:]
-                logits.append(self.model.logits(last_hidden))
-                output_rows.append([])
-                if self.mtp:
-                    group = cache.groups[MTP]
-                    if not context:
-                        first_page = int(group.block_slabs(row)[0])
-                        self.draft_keys[first_page, 0].zero_()
-                        self.draft_values[first_page, 0].zero_()
-                    skip = int(context == 0)
-                    if len(ids) > skip:
-                        previous = torch.cat((state.hidden, hidden[:-1]))[skip:]
-                        self._draft(
-                            ids[skip:],
-                            previous,
-                            group,
-                            row,
-                            context + skip,
-                            decode=decode,
-                        )
-                if plan.needs_prompt_logprobs:
-                    # Shared scoring kernels use the CPU compiler here.
-                    def project_for_scores(selected: Tensor) -> Tensor:
-                        return self.model.logits(selected.to(self.device)).float().cpu()
+            if plan.needs_prompt_logprobs:
+                # Shared scoring kernels use the CPU compiler here.
+                def project_for_scores(selected: Tensor) -> Tensor:
+                    return self.model.logits(selected.to(self.device)).float().cpu()
 
-                    prompt.append(
-                        prompt_scores(
-                            plan, hidden.cpu(), project_for_scores, token_start=start
-                        )
+                prompt.append(
+                    prompt_scores(
+                        plan, hidden.cpu(), project_for_scores, token_start=start
                     )
+                )
             # Graph outputs and slices may alias buffers overwritten on the next replay.
             states.append(
                 (

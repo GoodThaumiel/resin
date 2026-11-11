@@ -204,7 +204,11 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(
             tokens = [event.token_id for event in events]
             assert not runner.states
         if graph != "eager" and mtp:
-            assert {kind for kind, _ in runner.graphs} == {"target", "verify", "draft"}
+            assert {kind for kind, _, _ in runner.graphs} == {
+                "target",
+                "verify",
+                "draft",
+            }
             assert runner.graph_replays > 0
             assert runner.graph_fallbacks == 0
         return tokens, runner.drafted, runner.accepted
@@ -383,6 +387,75 @@ def test_mtp_npugraph_ex_rejected_before_loading_checkpoint(tmp_path):
         )
 
 
+@pytest.mark.parametrize("mode", ["eager", "simulated_aclgraph", "npu_aclgraph"])
+@torch.inference_mode()
+def test_mtp_batch_verify_matches_independent_rows(tmp_path, monkeypatch, mode):
+    device = npu_device() if mode == "npu_aclgraph" else torch.device("cpu")
+    make_checkpoint(tmp_path, raw_config=NPU_CONFIG if device.type == "npu" else CONFIG)
+    if mode == "simulated_aclgraph":
+        install_cpu_graph(monkeypatch)
+    runner = QwenAscendRunner(tmp_path, device=device, mtp=True)
+    torch.manual_seed(29)
+    for parameter in runner.model.parameters():
+        parameter.normal_(0, 0.15)
+    c = runner.model.config
+    shape = (5, 128, c.num_key_value_heads, c.head_dim)
+    runner.keys = torch.randn(
+        (c.full_layer_count, *shape), dtype=torch.bfloat16, device=device
+    )
+    runner.values = torch.randn_like(runner.keys)
+    runner.draft_keys = torch.zeros_like(runner.keys[0])
+    runner.draft_values = torch.zeros_like(runner.draft_keys)
+    if mode != "eager":
+        before = (runner.keys[:, 1:].clone(), runner.values[:, 1:].clone())
+        runner.graph_mode = "aclgraph"
+        runner.graph_capture_pages = (2,)
+        runner.graph_verify_batches = (1, 2)
+        runner._capture_startup_graphs((2,))
+        torch.testing.assert_close(runner.keys[:, 1:], before[0])
+        torch.testing.assert_close(runner.values[:, 1:], before[1])
+
+    tables = (np.array([4, 1]), np.array([3]))
+    group = SimpleNamespace(block_slabs=lambda row: tables[row])
+    rows = []
+    for row, context in enumerate((127, 8)):
+        state = runner._empty_state()
+        state.recurrent.normal_(0, 0.1)
+        state.convolution.normal_(0, 0.1)
+        rows.append((row, context, state, runner._long([5 + row, 7 + row])))
+
+    short_row = (rows[0][0], 3, *rows[0][2:])
+    for batch in (rows, list(reversed(rows)), rows[:1], [short_row, rows[1]]):
+        ref_keys, ref_values = runner.keys.clone(), runner.values.clone()
+        expected = []
+        for row, context, state, ids in batch:
+            metadata = runner._page_table(group, row, context, context + 2)
+            expected.append(
+                runner.model.target(
+                    ids,
+                    *metadata,
+                    state.recurrent,
+                    state.convolution,
+                    ref_keys,
+                    ref_values,
+                    verify=True,
+                )
+            )
+        hidden, *states = runner._verify_targets(group, batch)
+        for index, (reference, *ref_states) in enumerate(expected):
+            torch.testing.assert_close(hidden[index], reference, rtol=0.03, atol=0.004)
+            for state, ref in zip(states, ref_states, strict=True):
+                torch.testing.assert_close(state[:, index], ref, rtol=0.03, atol=0.004)
+        torch.testing.assert_close(
+            runner.keys[:, 1:], ref_keys[:, 1:], rtol=0.03, atol=0.004
+        )
+        torch.testing.assert_close(
+            runner.values[:, 1:], ref_values[:, 1:], rtol=0.03, atol=0.004
+        )
+    assert runner.graph_replays == (0 if mode == "eager" else 3)
+    assert runner.graph_fallbacks == (0 if mode == "eager" else 1)
+
+
 @torch.inference_mode()
 def test_aclgraph_rejects_input_changes_before_copy(monkeypatch):
     install_cpu_graph(monkeypatch)
@@ -419,8 +492,9 @@ def test_mtp_aclgraph_mixed_requests_stop_and_release(
         if graph:
             runner.graph_mode = "aclgraph"
             runner.graph_capture_pages = (1, 2)
+            runner.graph_verify_batches = (1, 2)
         with Engine(
-            runner, context_length=256, max_running_requests=3, enable_overlap=False
+            runner, context_length=256, max_running_requests=4, enable_overlap=False
         ) as engine:
             requests = [
                 engine.submit(
@@ -435,14 +509,22 @@ def test_mtp_aclgraph_mixed_requests_stop_and_release(
                 )
                 for length, temperature in [(127, 0), (3, 0), (4, 0.7)]
             ]
+            # Token 3 has no component at input feature zero, so its draft
+            # is rejected in the same batch where token 5 can be accepted.
+            requests.append(
+                engine.submit(
+                    [3] * 5,
+                    sampling_params=SamplingParams(temperature=0, max_output_tokens=2),
+                )
+            )
             engine.step()
             assert all(not request.done for request in requests)
             assert engine.cancel(requests[1])
             for _ in range(8):
                 engine.step()
-                if requests[0].done and requests[2].done:
+                if all(requests[i].done for i in (0, 2, 3)):
                     break
-            results = [requests[i].take_result() for i in (0, 2)]
+            results = [requests[i].take_result() for i in (0, 2, 3)]
             assert not runner.states
             # Reusing the pool after cancellation/EOS must not reuse live state.
             again = engine.submit(
@@ -456,10 +538,10 @@ def test_mtp_aclgraph_mixed_requests_stop_and_release(
             results.append(again.take_result())
             assert not runner.states
         assert runner.drafted > 0
-        assert runner.accepted == (runner.drafted if accept_draft else 0)
+        assert runner.accepted == (runner.drafted - 1 if accept_draft else 0)
         return results
 
-    assert generate(True) == generate(False) == [[5, 3], [5, 3], [5, 3, 3]]
+    assert generate(True) == generate(False) == [[5, 3], [5, 3], [3, 3], [5, 3, 3]]
 
 
 def test_modelslim_qkv_tp_preserves_segment_and_scale_order(tmp_path):

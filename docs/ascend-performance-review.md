@@ -9,7 +9,7 @@ target-only ACLGraph 能生成正常文本，graph decode 比 eager 更快；尚
 
 | 优先级 | 工作 | 当前代码证据及影响 | 验收方式 |
 |---|---|---|---|
-| P0 | 真正的 batch 执行及 batch graph buckets | `runner.py::_forward` 对每条 sequence 分别跑完整模型。请求调度能组 batch，但设备前向仍是逐行执行。`--graph-capture-pages` 只控制上下文页容量，不是 batch size。并发增加没有把 GEMV 合并为更大的 GEMM。 | 引入独立的 batch-size 与 context-page bucket，支持不同长度、空槽和页表，比较并发 1/4/8/16 的输出吞吐及 p95 TPOT。 |
+| P0 | 批量执行及 batch graph buckets | Tensor attention 的 MTP verify 已合并批内请求，`--graph-verify-batches` 配置图的请求数。`--graph-capture-pages` 控制 KV 上下文容量。普通 decode、draft 和 prefill 仍逐条执行。 | 将批量执行扩展至普通 decode 和 draft，支持不同长度和空槽，比较并发 1/4/8/16 的输出吞吐及 p95 TPOT。 |
 | P0 | 原生 paged attention 接入 graph | `ops.py::tensor_attention` 每层 `index_select` 搬运历史 KV、`repeat_interleave` 扩展 GQA 头，再调用 SDPA；graph 只能减少 Host 下发，无法消除这些显存读写。已有 `--attention native` 只用于 eager target，draft 仍用 tensor 路径。 | 先校验 FIA 在分块 prefill、GQA、变长、verify 和跨页时的结果，再解决设备长度元数据或任务参数更新；同长度、精度、并发下测时间和峰值显存。 |
 | P0 | GDN recurrent、chunk prefill 与卷积融合 | `model.py::delta_rule` 逐 token 做多次 FP32 逐元素运算和归约；参考 prefill 的 token 循环在每个 GDN 层执行。卷积用 unfold、乘法、归约组合。原生 recurrent probe 仍返回零，不能直接打开。 | 先定位 recurrent probe 的状态布局、序列边界和写回语义；逐步替换 prefill/recurrent/conv，覆盖非零初始状态、连续 chunk、MTP 两步与拒绝回滚。 |
 | P1 | 减少每步同步、元数据传输及状态复制 | 每行新建 token/position/page/slot tensor，MTP `.tolist()`、`.item()` 取回结果，step 末尾设备 synchronize；全量 recurrent/conv/hidden 又 clone，图输入还 copy 一遍。 | 固定元数据 staging buffer、批量 H2D、设备采样/接受判定、预分配状态池或双缓冲；先保证 lease 完成后再回收，不能直接删同步。 |

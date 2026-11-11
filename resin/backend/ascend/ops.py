@@ -84,24 +84,25 @@ def tensor_attention(
     pages: Tensor,
     positions: Tensor,
 ) -> Tensor:
-    """TND attention with device-side positions and fixed physical page tables."""
-    write_kv(keys, values, key, value, slots)
-    key = keys.index_select(0, pages).flatten(0, 1)
-    value = values.index_select(0, pages).flatten(0, 1)
-    repeats = query.shape[1] // key.shape[1]
-    key = key.repeat_interleave(repeats, dim=1).transpose(0, 1)
-    value = value.repeat_interleave(repeats, dim=1).transpose(0, 1)
-    visible = torch.arange(key.shape[1], device=query.device) <= positions[:, None]
-    return (
-        F.scaled_dot_product_attention(
-            query.transpose(0, 1).unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            attn_mask=visible,
-        )
-        .squeeze(0)
-        .transpose(0, 1)
-    )
+    """Attend to each row's paged KV with device-side causal positions."""
+    single = query.ndim == 3
+    if single:
+        query, pages, positions = query[None], pages[None], positions[None]
+    write_kv(keys, values, key.flatten(0, -3), value.flatten(0, -3), slots.flatten())
+    batch, page_count = pages.shape
+    key = keys.index_select(0, pages.flatten()).unflatten(0, (batch, page_count))
+    value = values.index_select(0, pages.flatten()).unflatten(0, (batch, page_count))
+    repeats = query.shape[-2] // key.shape[-2]
+    key = key.flatten(1, 2).repeat_interleave(repeats, dim=2).transpose(1, 2)
+    value = value.flatten(1, 2).repeat_interleave(repeats, dim=2).transpose(1, 2)
+    visible = torch.arange(key.shape[-2], device=query.device) <= positions[..., None]
+    output = F.scaled_dot_product_attention(
+        query.transpose(1, 2),
+        key,
+        value,
+        attn_mask=visible[0] if single else visible[:, None],
+    ).transpose(1, 2)
+    return output[0] if single else output
 
 
 class NativePagedAttention:

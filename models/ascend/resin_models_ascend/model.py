@@ -103,7 +103,12 @@ class Attention(nn.Module):
         q = apply_rotary(self.q_norm(q), cos, sin)
         k = apply_rotary(self.k_norm(k), cos, sin)
         if native is None:
+            if positions.ndim == 2:
+                q = q.unflatten(0, positions.shape)
+                k = k.unflatten(0, positions.shape)
+                v = v.unflatten(0, positions.shape)
             mixed = tensor_attention(q, k, v, *cache, slots, pages, positions)
+            mixed = mixed.reshape_as(gate)
         else:
             mixed = native(q, k, v, *cache, slots, pages, length)
         return self.tp.sum(self.o_proj((mixed * gate.sigmoid()).flatten(1)))
@@ -119,24 +124,26 @@ def apply_rotary(value: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 def delta_rule(
     q: Tensor, k: Tensor, v: Tensor, decay: Tensor, beta: Tensor, state: Tensor
 ):
-    repeats = v.shape[1] // q.shape[1]
+    repeats = v.shape[-2] // q.shape[-2]
     q = q.float()
     k = k.float()
     q = q * (q.square().sum(-1, keepdim=True) + 1e-6).rsqrt() * q.shape[-1] ** -0.5
     k = k * (k.square().sum(-1, keepdim=True) + 1e-6).rsqrt()
-    q = q.repeat_interleave(repeats, dim=1)
-    k = k.repeat_interleave(repeats, dim=1)
+    q = q.repeat_interleave(repeats, dim=-2)
+    k = k.repeat_interleave(repeats, dim=-2)
     outputs = []
     first_state = state
-    for i in range(q.shape[0]):
-        state = state * decay[i].exp()[:, None, None]
-        key = k[i].unsqueeze(-1)
-        delta = (v[i].float() - (state * key).sum(-2)) * beta[i, :, None]
+    for i in range(q.shape[-3]):
+        state = state * decay[..., i, :].exp()[..., None, None]
+        key = k[..., i, :, :].unsqueeze(-1)
+        delta = (v[..., i, :, :].float() - (state * key).sum(-2)) * beta[
+            ..., i, :, None
+        ]
         state = state + key * delta.unsqueeze(-2)
         if i == 0:
             first_state = state
-        outputs.append((state * q[i].unsqueeze(-1)).sum(-2))
-    return torch.stack(outputs).to(v.dtype), state, first_state
+        outputs.append((state * q[..., i, :, :].unsqueeze(-1)).sum(-2))
+    return torch.stack(outputs, dim=-3).to(v.dtype), state, first_state
 
 
 class GatedDeltaNet(nn.Module):
@@ -164,18 +171,20 @@ class GatedDeltaNet(nn.Module):
     ):
         c = self.config
         width = c.linear_conv_kernel_dim
-        window = torch.cat((convolution, self.in_proj_qkv(hidden).t()), dim=-1)
+        window = torch.cat(
+            (convolution, self.in_proj_qkv(hidden).transpose(-2, -1)), dim=-1
+        )
         # Explicit depthwise dot products also cover one-token graph decode.
         mixed = (window.float().unfold(-1, width, 1) * self.conv1d.weight.float()).sum(
             -1
         )
-        mixed = F.silu(mixed.to(hidden.dtype)).transpose(0, 1)
+        mixed = F.silu(mixed.to(hidden.dtype)).transpose(-2, -1)
         q, k, v = mixed.split(
             (c.linear_key_dim, c.linear_key_dim, c.linear_value_dim), dim=-1
         )
-        q = q.reshape(-1, c.linear_num_key_heads, c.linear_key_head_dim)
+        q = q.unflatten(-1, (c.linear_num_key_heads, c.linear_key_head_dim))
         k = k.reshape_as(q)
-        v = v.reshape(-1, c.linear_num_value_heads, c.linear_value_head_dim)
+        v = v.unflatten(-1, (c.linear_num_value_heads, c.linear_value_head_dim))
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden).float() + self.dt_bias.float()
         )
@@ -186,7 +195,7 @@ class GatedDeltaNet(nn.Module):
         else:
             core, state, first_state = delta_rule(q, k, v, decay, beta, state)
         gate = self.in_proj_z(hidden).reshape_as(core)
-        mixed = self.tp.sum(self.out_proj(self.norm(core, gate).flatten(1)))
+        mixed = self.tp.sum(self.out_proj(self.norm(core, gate).flatten(-2)))
         return mixed, state, first_state, window
 
 
@@ -291,8 +300,8 @@ class QwenModel(nn.Module):
         verify: bool = False,
         native_prefill: bool = False,
     ):
-        hidden = self.text.embed_tokens(ids)
-        rotary = self.rotary(positions, hidden.dtype)
+        hidden = self.text.embed_tokens(ids.flatten())
+        rotary = self.rotary(positions.flatten(), hidden.dtype)
         states, windows, first_states, first_windows = [], [], [], []
         full = linear = 0
         for layer in self.text.layers:
@@ -311,20 +320,25 @@ class QwenModel(nn.Module):
                 full += 1
             else:
                 mixed, state, first_state, window = layer.linear_attn(
-                    normalized,
+                    normalized.reshape(*ids.shape, -1),
                     recurrent[linear],
                     convolution[linear],
                     native_prefill,
                 )
                 width = convolution.shape[-1]
                 states.append(state)
-                windows.append(window[:, hidden.shape[0] :])
+                windows.append(window[..., ids.shape[-1] :])
                 if verify:
                     first_states.append(first_state)
-                    first_windows.append(window[:, 1 : 1 + width])
+                    first_windows.append(window[..., 1 : 1 + width])
+                mixed = mixed.reshape_as(hidden)
                 linear += 1
             hidden = layer.finish(hidden, mixed)
-        result = self.text.norm(hidden), torch.stack(states), torch.stack(windows)
+        result = (
+            self.text.norm(hidden).reshape(*ids.shape, -1),
+            torch.stack(states),
+            torch.stack(windows),
+        )
         if verify:
             return (*result, torch.stack(first_states), torch.stack(first_windows))
         return result

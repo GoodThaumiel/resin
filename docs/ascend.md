@@ -91,7 +91,7 @@ write slot, and recurrent state.
 
 ```bash
 resin-ascend-serve /models/Qwen3.5-4B --mtp --graph aclgraph \
-  --graph-capture-pages 1 2 4 8 --verbose
+  --graph-capture-pages 1 2 4 8 --graph-verify-batches 2 4 8 --verbose
 ```
 
 The checkpoint must include MTP weights. Greedy requests (`temperature=0`)
@@ -102,7 +102,19 @@ Verification returns both the final state and the state after the anchor;
 rejection commits only the latter. Writes beyond the accepted prefix remain
 masked and are overwritten on subsequent execution. Live recurrent,
 convolution, and hidden states are copied before another row can replay the
-same graph. Warmup uses distinct slots 0 and 1 in the reserved page for verify.
+same graph. Verify warmup uses distinct slots in the reserved page.
+
+With tensor attention, greedy MTP rows in a decode step share one batched
+target forward over two query tokens per row (anchor and draft). Their KV
+tables and GDN states remain independent. Draft generation, draft cache
+updates after acceptance, and ordinary target decode run per request.
+`--graph-verify-batches` captures additional verify graphs for exact request
+counts, with one graph for each combination of batch size and configured KV
+page bucket. A verify batch of four requests runs eight query tokens. The
+page bucket follows the longest sequence in the verify batch. If either
+dimension misses, verify runs as a batch in eager mode. A batch of one still
+uses the original per-request graph. The eager native attention path uses
+per-request verify.
 
 Logits projection, argmax, acceptance decisions, state commit, and prefill
 remain eager. Positive-temperature requests use target-only sampling and
@@ -115,7 +127,7 @@ The graph bucket uses the whole context including the verification tokens.
 For example, verification at context 127 needs bucket 2, even though its
 anchor alone fits in bucket 1. Missing buckets fall back to eager for that
 operation, without runtime capture when startup buckets are configured.
-Graph startup memory increases because each bucket now holds three graphs.
+Every extra verify batch size adds one graph per configured KV page bucket.
 
 After rebuilding both packages, run the CPU and NPU tests on the server:
 
