@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ from resin import Engine, Parallelism, SamplingParams
 from resin.backend.ascend.graphs import DecodeGraph
 from resin.backend.ascend.ops import DynamicInt8Linear, tensor_attention
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_ascend import runner as ascend_runner
 from resin_models_ascend.checkpoint import load_model, shard_tensor
 from resin_models_ascend.model import QwenModel, TensorParallel
 from resin_models_ascend.runner import QwenAscendRunner
@@ -99,6 +101,49 @@ def test_chunked_prefill_returns_tokens_only_for_completed_prompts(tmp_path):
         assert [event.token_id for event in engine.step()] == [3]
         assert long.done
         assert long.take_result() == [3]
+
+
+def test_startup_aclgraph_captures_configured_buckets_before_decode(
+    tmp_path, monkeypatch
+):
+    make_checkpoint(tmp_path)
+    runner = QwenAscendRunner(tmp_path, device=torch.device("cpu"), cache_pages=16)
+    # Exercise Engine binding and decode routing on CPU with a stand-in graph.
+    runner.graph_mode = "aclgraph"
+    runner.graph_capture_pages = (1, 4)
+    captured = []
+
+    class EagerGraph:
+        def __init__(self, forward, inputs, *, mode):
+            assert mode == "aclgraph"
+            assert torch.is_inference_mode_enabled()
+            assert all(not tensor.count_nonzero() for tensor in inputs)
+            captured.append(inputs[2].numel())
+            self.forward = forward
+
+        def replay(self, inputs):
+            return self.forward(*inputs)
+
+    monkeypatch.setattr(ascend_runner, "DecodeGraph", EagerGraph)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda _device: None), raising=False
+    )
+    with Engine(runner, context_length=512, enable_overlap=False) as engine:
+        assert captured == [1, 4]
+        assert runner.graph_replays == 0
+        request = engine.submit(
+            [1] * 127,
+            sampling_params=SamplingParams(temperature=0, max_output_tokens=4),
+        )
+        for _ in range(8):
+            engine.step()
+            if request.done:
+                break
+        assert request.take_result() == [3] * 4
+
+    assert captured == [1, 4]
+    assert runner.graph_replays == 1
+    assert runner.graph_fallbacks == 2
 
 
 @pytest.mark.parametrize("accept_draft", [True, False])

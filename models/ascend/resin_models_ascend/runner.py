@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +63,7 @@ class QwenAscendRunner:
         cache_pages: int = 128,
         prefill_chunk: int = 256,
         graph_max_pages: int = 32,
+        graph_capture_pages: Sequence[int] | None = None,
         mtp: bool = False,
         quantization: str = "bf16",
         graph: str = "eager",
@@ -77,6 +79,21 @@ class QwenAscendRunner:
             "native",
         }:
             raise ValueError("unsupported Ascend graph or attention mode")
+        capture_pages = None
+        if graph_capture_pages is not None:
+            if graph != "aclgraph":
+                raise ValueError("graph_capture_pages requires graph='aclgraph'")
+            if not graph_capture_pages or any(
+                type(pages) is not int
+                or not 1 <= pages <= graph_max_pages
+                or pages & (pages - 1)
+                for pages in graph_capture_pages
+            ):
+                raise ValueError(
+                    "graph_capture_pages must contain positive powers of two "
+                    "up to graph_max_pages"
+                )
+            capture_pages = tuple(sorted(set(graph_capture_pages)))
         if graph != "eager" and (
             tp.size > 1 or mtp or device.type != "npu" or attention != "torch"
         ):
@@ -112,6 +129,7 @@ class QwenAscendRunner:
         self.states: dict[int, tuple[int, LiveState]] = {}
         self.graph_mode = graph
         self.graph_max_pages = graph_max_pages
+        self.graph_capture_pages = capture_pages
         self.graphs: dict[int, DecodeGraph] = {}
         self.graph_replays = 0
         self.graph_fallbacks = 0
@@ -137,6 +155,8 @@ class QwenAscendRunner:
                 shape, dtype=torch.bfloat16, device=self.device
             )
             self.draft_values = torch.zeros_like(self.draft_keys)
+        if self.graph_capture_pages is not None:
+            self._capture_startup_graphs(self.graph_capture_pages)
         self.binding.commit(pool_id)
 
     def release(self, sequence_ids) -> None:
@@ -198,6 +218,52 @@ class QwenAscendRunner:
             self._long(slots),
         )
 
+    def _capture_graph(
+        self, bucket: int, inputs: tuple[Tensor, ...], *, startup: bool = False
+    ) -> DecodeGraph:
+        def forward(*args):
+            return self.model.target(*args, self.keys, self.values)
+
+        stage = "startup" if startup else "request"
+        log.info(
+            "Capturing Ascend decode graph, mode=%s, page bucket=%d, stage=%s",
+            self.graph_mode,
+            bucket,
+            stage,
+        )
+        graph = DecodeGraph(forward, inputs, mode=self.graph_mode)
+        if startup:
+            graph.replay(inputs)
+            torch.npu.synchronize(self.device)
+        log.info(
+            "Ascend decode graph captured, mode=%s, page bucket=%d, stage=%s",
+            self.graph_mode,
+            bucket,
+            stage,
+        )
+        return graph
+
+    @torch.inference_mode()
+    def _capture_startup_graphs(self, buckets: tuple[int, ...]) -> None:
+        state = self._empty_state()
+        zero = self._long([0])
+        # Page and slot zero are reserved for warmup and startup replay.
+        self.graphs = {
+            bucket: self._capture_graph(
+                bucket,
+                (
+                    zero,
+                    zero,
+                    zero.new_zeros((bucket,)),
+                    zero,
+                    state.recurrent,
+                    state.convolution,
+                ),
+                startup=True,
+            )
+            for bucket in buckets
+        }
+
     def _target(self, ids, group, row, context, state, *, decode=False, verify=False):
         length = context + len(ids)
         pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
@@ -205,33 +271,25 @@ class QwenAscendRunner:
         eligible = (
             self.graph_mode != "eager" and decode and not verify and len(ids) == 1
         )
-        capture = eligible and bucket <= self.graph_max_pages
+        graph = self.graphs.get(bucket) if eligible else None
+        lazy_capture = (
+            eligible
+            and graph is None
+            and self.graph_capture_pages is None
+            and bucket <= self.graph_max_pages
+        )
         positions, page_table, slots = self._page_table(
             group,
             row,
             context,
             length,
-            bucket=bucket if capture else 0,
+            bucket=bucket if graph is not None or lazy_capture else 0,
         )
         inputs = (ids, positions, page_table, slots, state.recurrent, state.convolution)
-        if capture:
-            if bucket not in self.graphs:
-
-                def forward(*args):
-                    return self.model.target(*args, self.keys, self.values)
-
-                log.info(
-                    "Capturing Ascend decode graph, mode=%s, page bucket=%d",
-                    self.graph_mode,
-                    bucket,
-                )
-                self.graphs[bucket] = DecodeGraph(forward, inputs, mode=self.graph_mode)
-                log.info(
-                    "Ascend decode graph captured, mode=%s, page bucket=%d",
-                    self.graph_mode,
-                    bucket,
-                )
-            result = self.graphs[bucket].replay(inputs)
+        if lazy_capture:
+            graph = self.graphs[bucket] = self._capture_graph(bucket, inputs)
+        if graph is not None:
+            result = graph.replay(inputs)
             self.graph_replays += 1
             log.debug(
                 "Ascend decode graph replay, mode=%s, page bucket=%d",

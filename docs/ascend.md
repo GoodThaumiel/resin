@@ -76,7 +76,8 @@ curl --fail-with-body http://127.0.0.1:8000/v1/chat/completions \
 ## Validate ACLGraph decode
 
 ```bash
-resin-ascend-serve /models/Qwen3.5-4B --graph aclgraph --verbose
+resin-ascend-serve /models/Qwen3.5-4B --graph aclgraph \
+  --graph-capture-pages 1 2 4 8 --verbose
 ```
 
 This mode captures each one-token target forward using TorchNPU's
@@ -86,10 +87,18 @@ eager prefill and sampling. Capture writes to a reserved scratch page. Each
 replay updates the input buffers with the live token, position, page table,
 write slot, and recurrent state.
 
+With `--graph-capture-pages`, Resin captures and replays each listed bucket
+once on the scratch page before the HTTP listener starts. Sizes are powers of
+two in KV pages of 128 tokens. For example, `1 2 4 8` covers decode lengths
+through 1,024 tokens, counting prompt and generated history. Requests whose
+bucket is absent use eager decode. Omit the option to capture lazily on the
+first request for each bucket. The startup option applies to `--graph aclgraph`.
+
 Send the same requests at temperature zero to eager and ACLGraph servers.
 Compare the generated output, including a decode that crosses a 128-token
 page boundary. With `--verbose`, look for `mode=aclgraph` capture and replay
-messages. `--graph-max-pages` controls the largest graph page bucket.
+messages. Startup captures are marked `stage=startup`. `--graph-max-pages`
+controls the largest graph page bucket.
 Requests above that limit use eager decode and log a fallback.
 
 The paged-attention replay test varies the page table and position within a

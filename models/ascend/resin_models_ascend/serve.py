@@ -40,6 +40,12 @@ def main(argv=None):
     parser.add_argument("--native-gdn-prefill", action="store_true")
     parser.add_argument("--graph", choices=GRAPH_MODES, default="eager")
     parser.add_argument("--graph-max-pages", type=int, default=32)
+    parser.add_argument(
+        "--graph-capture-pages",
+        type=int,
+        nargs="+",
+        help="pre-capture these KV page buckets before serving with --graph aclgraph",
+    )
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -58,6 +64,8 @@ def main(argv=None):
         parser.error(
             f"{args.graph} requires one card, target-only decode and --attention torch"
         )
+    if args.graph_capture_pages is not None and args.graph != "aclgraph":
+        parser.error("--graph-capture-pages requires --graph aclgraph")
     if (
         min(
             args.context_length,
@@ -95,6 +103,7 @@ def main(argv=None):
                 quantization=args.quantization,
                 graph=args.graph,
                 graph_max_pages=args.graph_max_pages,
+                graph_capture_pages=args.graph_capture_pages,
                 attention=args.attention,
                 native_gdn_prefill=args.native_gdn_prefill,
             )
