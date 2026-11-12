@@ -12,7 +12,7 @@ from resin.backend.ascend.ops import DynamicInt8Linear, tensor_attention
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_ascend import runner as ascend_runner
 from resin_models_ascend.checkpoint import load_model, shard_tensor
-from resin_models_ascend.model import QwenModel, TensorParallel
+from resin_models_ascend.model import QwenModel, RMSNorm, TensorParallel, delta_rule
 from resin_models_ascend.runner import QwenAscendRunner
 
 CONFIG = {
@@ -206,11 +206,14 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(
             tokens = [event.token_id for event in events]
             assert not runner.states
         if graph != "eager" and mtp:
-            assert {kind for kind, _, _ in runner.graphs} == {
+            kinds = {
                 "target",
                 "verify",
                 "draft",
             }
+            if draft_count > 1:
+                kinds.add("draft_chain")
+            assert {kind for kind, _, _ in runner.graphs} == kinds
             assert runner.graph_replays > 0
             assert runner.graph_fallbacks == 0
         return tokens, runner.drafted, runner.accepted
@@ -387,6 +390,98 @@ def test_mtp_npugraph_ex_rejected_before_loading_checkpoint(tmp_path):
         QwenAscendRunner(
             tmp_path, device=SimpleNamespace(type="npu"), mtp=True, graph="npugraph_ex"
         )
+
+
+@torch.inference_mode()
+def test_mtp3_draft_chain_replays_once_and_preserves_candidates(tmp_path, monkeypatch):
+    make_checkpoint(tmp_path)
+    install_cpu_graph(monkeypatch)
+    runner = QwenAscendRunner(
+        tmp_path, device=torch.device("cpu"), num_speculative_tokens=3
+    )
+    torch.manual_seed(57)
+    for parameter in runner.model.parameters():
+        parameter.normal_(0, 0.15)
+    runner.graph_mode = "aclgraph"
+    runner.graph_capture_pages = (2,)
+    c = runner.model.config
+    runner.draft_keys = torch.randn(
+        5, 128, c.num_key_value_heads, c.head_dim, dtype=torch.bfloat16
+    )
+    runner.draft_values = torch.randn_like(runner.draft_keys)
+    runner.keys = runner.draft_keys[None].clone()
+    runner.values = runner.draft_values[None].clone()
+    before = runner.draft_keys[1:].clone()
+    runner._capture_startup_graphs((2,))
+    torch.testing.assert_close(runner.draft_keys[1:], before, rtol=0, atol=0)
+
+    tables = (np.array([1, 2]), np.array([3, 4]))
+    group = SimpleNamespace(block_slabs=lambda row: tables[row])
+    ref_keys, ref_values = runner.draft_keys.clone(), runner.draft_values.clone()
+    outputs = []
+    for row, context in enumerate((126, 127)):
+        anchor = torch.tensor([5 + row])
+        hidden = torch.randn(1, c.hidden_size, dtype=torch.bfloat16)
+        tokens = [anchor]
+        previous = hidden
+        for offset in range(3):
+            start = context + offset
+            metadata = runner._page_table(group, row, start, start + 1)
+            previous = runner.model.draft(
+                tokens[-1], previous, *metadata, ref_keys, ref_values
+            )
+            tokens.append(runner.model.logits(previous).argmax(dim=-1))
+        candidates = runner._draft_candidates(anchor, hidden, group, row, context)
+        outputs.append((candidates, torch.cat(tokens)))
+    assert runner.graph_replays == 2
+    for actual, expected in outputs:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(runner.draft_keys[1:], ref_keys[1:], rtol=0, atol=0)
+    torch.testing.assert_close(runner.draft_values[1:], ref_values[1:], rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_aclgraph_fused_rmsnorm_matches_reference():
+    device = npu_device()
+    torch.manual_seed(12)
+    x = torch.randn(4, 8, 128, dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(x)
+    norm = RMSNorm(128, 1e-6).to(device=device, dtype=x.dtype)
+    norm.weight.normal_(0, 0.2)
+    expected = norm(x), norm(x, gate)
+    norm.prepare_fused()
+    graph = DecodeGraph(
+        lambda x, gate: (norm(x), norm(x, gate)), (x, gate), mode="aclgraph"
+    )
+    for output, reference in zip(graph.replay((x, gate)), expected, strict=True):
+        torch.testing.assert_close(output, reference, rtol=0.02, atol=0.004)
+
+
+@torch.inference_mode()
+def test_aclgraph_triton_gdn_matches_reference_prefixes():
+    device = npu_device()
+    pytest.importorskip("triton")
+    from resin_models_ascend.triton_gdn import fused_recurrent_gdn
+
+    torch.manual_seed(13)
+    qkv = torch.randn(2, 4, 16, 128, dtype=torch.bfloat16, device=device)
+    q, k, v = qkv.split((4, 4, 8), dim=2)
+    a = torch.randn(2, 4, 8, dtype=q.dtype, device=device)
+    b = torch.randn_like(a)
+    a_log = torch.randn(8, device=device)
+    dt_bias = torch.randn_like(a_log)
+    state = torch.randn(2, 8, 128, 128, device=device) * 0.1
+
+    def fused(q, k, v, a, b, state):
+        return fused_recurrent_gdn(q, k, v, a, b, a_log, dt_bias, state, verify=True)
+
+    graph = DecodeGraph(fused, (q, k, v, a, b, state), mode="aclgraph")
+    for live_state in (state, state.flip(0)):
+        decay = -a_log.exp() * torch.nn.functional.softplus(a.float() + dt_bias)
+        expected = delta_rule(q, k, v, decay, b.sigmoid(), live_state, verify=True)
+        actual = graph.replay((q, k, v, a, b, live_state))
+        for output, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(output, reference, rtol=0.02, atol=0.002)
 
 
 @pytest.mark.parametrize("mode", ["eager", "simulated_aclgraph", "npu_aclgraph"])

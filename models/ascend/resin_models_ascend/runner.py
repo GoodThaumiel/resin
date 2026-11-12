@@ -33,7 +33,7 @@ from resin.backend.sampling import (
 )
 from resin.backend.topology import ParallelismCapabilities
 from resin_models_ascend.checkpoint import load_model
-from resin_models_ascend.model import TensorParallel
+from resin_models_ascend.model import GatedDeltaNet, RMSNorm, TensorParallel
 
 log = logging.getLogger(__name__)
 PAGE_TOKENS = 128
@@ -71,6 +71,8 @@ class QwenAscendRunner:
         graph: str = "eager",
         attention: str = "torch",
         native_gdn_prefill: bool = False,
+        fused_rmsnorm: bool = False,
+        triton_gdn: bool = False,
     ) -> None:
         if num_speculative_tokens is not None and (
             type(num_speculative_tokens) is not int
@@ -134,9 +136,27 @@ class QwenAscendRunner:
             raise ValueError("native attention requires an NPU")
         if native_gdn_prefill and device.type != "npu":
             raise ValueError("native GDN prefill requires an NPU")
+        if (fused_rmsnorm or triton_gdn) and device.type != "npu":
+            raise ValueError("fused RMSNorm and Triton GDN require an NPU")
+        if triton_gdn and graph == "npugraph_ex":
+            raise ValueError("Triton GDN supports eager execution and raw ACLGraph")
         self.model = load_model(
             checkpoint, device, tp, mtp=mtp, quantization=quantization
         )
+        if fused_rmsnorm:
+            import torch_npu
+
+            if not hasattr(torch_npu, "npu_rms_norm"):
+                raise RuntimeError("fused RMSNorm requires torch_npu.npu_rms_norm")
+            for module in self.model.modules():
+                if isinstance(module, RMSNorm):
+                    module.prepare_fused()
+        if triton_gdn:
+            from resin_models_ascend.triton_gdn import fused_recurrent_gdn
+
+            for module in self.model.modules():
+                if isinstance(module, GatedDeltaNet):
+                    module.fused_recurrence = fused_recurrent_gdn
         self.device = device
         self.mtp = mtp
         self.num_speculative_tokens = draft_count
@@ -270,19 +290,26 @@ class QwenAscendRunner:
         startup: bool = False,
     ) -> DecodeGraph:
         def forward(*args):
+            if kind == "draft_chain":
+                return (self._run_draft_chain(*args),)
             if kind == "draft":
                 return (self.model.draft(*args, self.draft_keys, self.draft_values),)
             return self.model.target(
-                *args, self.keys, self.values, verify=kind == "verify"
+                *args,
+                self.keys,
+                self.values,
+                verify=kind == "verify",
+                decode=True,
             )
 
         scratch = [torch.zeros_like(value) for value in inputs]
         # Target inputs: ids, positions, pages, slots, recurrent, convolution.
         # Draft inputs: ids, previous hidden, positions, pages, slots.
-        position_index, slot_index = (2, 4) if kind == "draft" else (1, 3)
-        positions = torch.arange(inputs[0].numel(), device=self.device).reshape_as(
-            inputs[0]
-        )
+        position_index, slot_index = (2, 4) if kind.startswith("draft") else (1, 3)
+        shape = inputs[position_index].shape
+        positions = torch.arange(
+            inputs[position_index].numel(), device=self.device
+        ).reshape(shape)
         scratch[position_index].copy_(positions)
         scratch[slot_index].copy_(positions)
         scratch = tuple(scratch)
@@ -317,6 +344,8 @@ class QwenAscendRunner:
     def _capture_startup_graphs(self, buckets: tuple[int, ...]) -> None:
         state = self._empty_state()
         kinds = ("target", "verify", "draft") if self.mtp else ("target",)
+        if self.num_speculative_tokens > 1:
+            kinds += ("draft_chain",)
         verify_width = 1 + self.num_speculative_tokens
         for bucket in buckets:
             for kind in kinds:
@@ -327,6 +356,9 @@ class QwenAscendRunner:
                     if kind == "draft"
                     else (zero, zero, pages, zero, state.recurrent, state.convolution)
                 )
+                if kind == "draft_chain":
+                    metadata = zero.new_zeros(self.num_speculative_tokens)
+                    inputs = (zero, state.hidden, metadata, pages, metadata)
                 self.graphs[kind, bucket, 1] = self._capture_graph(
                     kind, bucket, inputs, startup=True
                 )
@@ -416,6 +448,7 @@ class QwenAscendRunner:
             length,
             verify=verify,
             native_prefill=self.native_gdn_prefill and not decode,
+            decode=decode,
         )
 
     def _draft(self, ids, hidden, group, row, start, *, decode=False):
@@ -441,6 +474,46 @@ class QwenAscendRunner:
         if eligible:
             self._graph_fallback("draft", bucket)
         return self.model.draft(*inputs, self.draft_keys, self.draft_values)
+
+    def _run_draft_chain(self, anchor, hidden, positions, pages, slots):
+        tokens = [anchor]
+        for step in range(self.num_speculative_tokens):
+            hidden = self.model.draft(
+                tokens[-1],
+                hidden,
+                positions[step : step + 1],
+                pages,
+                slots[step : step + 1],
+                self.draft_keys,
+                self.draft_values,
+            )
+            tokens.append(self.model.logits(hidden).argmax(dim=-1))
+        return torch.cat(tokens)
+
+    def _draft_candidates(self, anchor, hidden, group, row, context):
+        if self.num_speculative_tokens == 1:
+            hidden = self._draft(anchor, hidden, group, row, context, decode=True)
+            return torch.cat((anchor, self.model.logits(hidden).argmax(dim=-1)))
+
+        length = context + self.num_speculative_tokens
+        pages = (length + PAGE_TOKENS - 1) // PAGE_TOKENS
+        bucket = 1 << (pages - 1).bit_length()
+        eligible = self.graph_mode == "aclgraph"
+        graph, lazy_capture = self._graph_route("draft_chain", bucket, eligible)
+        positions, table, slots = self._page_table(
+            group, row, context, length, bucket=bucket if graph or lazy_capture else 0
+        )
+        inputs = (anchor, hidden, positions, table, slots)
+        if lazy_capture:
+            graph = self.graphs["draft_chain", bucket, 1] = self._capture_graph(
+                "draft_chain", bucket, inputs
+            )
+        if graph is not None:
+            # The next request can replay this graph before batch verify begins.
+            return self._replay_graph(graph, inputs, "draft_chain", bucket)[0].clone()
+        if eligible:
+            self._graph_fallback("draft_chain", bucket)
+        return self._run_draft_chain(*inputs)
 
     def _verify_targets(self, group, rows):
         batch_size = len(rows)
@@ -502,19 +575,10 @@ class QwenAscendRunner:
             start, end = plan.token_range(row)
             ids = self._long(cache.batch.token_ids[start:end].astype(np.int64))
             state = self.states[int(sequence)][1]
-            candidates = [ids]
-            draft_hidden = state.hidden
-            for offset in range(draft_count):
-                draft_hidden = self._draft(
-                    candidates[-1],
-                    draft_hidden,
-                    cache.groups[MTP],
-                    row,
-                    context + offset,
-                    decode=True,
-                )
-                candidates.append(self.model.logits(draft_hidden).argmax(dim=-1))
-            rows.append((row, context, state, torch.cat(candidates)))
+            candidates = self._draft_candidates(
+                ids, state.hidden, cache.groups[MTP], row, context
+            )
+            rows.append((row, context, state, candidates))
         if not rows:
             return {}
 

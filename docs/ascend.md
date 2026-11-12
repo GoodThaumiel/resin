@@ -105,7 +105,11 @@ Accepted draft KV is rebuilt using the verified target hidden states.
 Writes beyond the accepted prefix are masked and overwritten on later steps.
 
 Each page bucket captures one-token `target`, one-step `draft`, and
-`verify` graphs at startup. Verify warmup uses distinct slots in the
+`verify` graphs at startup. For K > 1 it also captures a `draft_chain`
+graph, with all K draft forwards, vocabulary projections, and argmax
+operations. Each eligible request replays this graph once. Its page bucket
+covers all K draft inputs, including chains that cross a page boundary.
+Verify warmup uses distinct slots in the
 reserved page, so a captured batch must fit `B × (K + 1) <= 128`.
 
 With tensor attention, greedy MTP rows in a decode step share one batched
@@ -120,9 +124,9 @@ dimension misses, verify runs as a batch in eager mode. A batch of one still
 uses the per-request graph. The eager native attention path uses
 per-request verify.
 
-Logits projection, argmax, acceptance decisions, multi-token draft KV repair,
-state commit, and prefill
-remain eager. Positive-temperature requests use target-only sampling and
+Target logits projection, acceptance decisions, multi-token draft KV repair,
+state commit, and prefill remain eager. A single accepted draft can use the
+one-step draft graph for KV repair. Positive-temperature requests use target-only sampling and
 maintain the draft cache. MTP graphs require one NPU and tensor attention;
 `--mtp --graph npugraph_ex`, TP graphs, and native-attention graphs remain
 unsupported. BF16 and dynamic W8A8 use the same graph routing, but each
@@ -133,6 +137,21 @@ For example, verification at context 127 needs bucket 2, even though its
 anchor alone fits in bucket 1. Missing buckets fall back to eager for that
 operation, without runtime capture when startup buckets are configured.
 Every extra verify batch size adds one graph per configured KV page bucket.
+
+### Fused decode operators
+
+Add `--fused-rmsnorm` to use `torch_npu.npu_rms_norm`. The Qwen
+`1 + weight` scale is prepared once at load time. Gated normalization
+keeps FP32 until after the separate SiLU and multiply.
+
+With a compatible Triton Ascend runtime installed, add `--triton-gdn` to
+fuse GDN decay and beta gating, Q/K normalization, and recurrence during
+decode and verify. The kernel keeps FP32 recurrent state and exports every
+prefix state for MTP verification. Convolution, projections, and output
+gating remain separate. This flag supports eager and raw ACLGraph.
+Both flags are opt-in so they can be measured independently against the
+reference. Before using them for a benchmark, run the ACLGraph tests below
+on the target stack and compare greedy outputs for the real checkpoint.
 
 After rebuilding both packages, run the CPU and NPU tests on the server:
 

@@ -53,8 +53,22 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.empty(size))
         self.eps = eps
         self.centered = centered
+        self.register_buffer("fused_scale", None, persistent=False)
+
+    def prepare_fused(self) -> None:
+        weight = self.weight.detach().float()
+        self.fused_scale = weight + 1 if self.centered else weight
 
     def forward(self, value: Tensor, gate: Tensor | None = None) -> Tensor:
+        if self.fused_scale is not None:
+            import torch_npu
+
+            # Keep the gated normalization in FP32 until after SiLU scaling.
+            x = value if gate is None else value.float()
+            result, _ = torch_npu.npu_rms_norm(x, self.fused_scale, self.eps)
+            if gate is not None:
+                result = result * F.silu(gate.float())
+            return result.to(value.dtype)
         normed = (
             value.float()
             * (value.float().square().mean(-1, keepdim=True) + self.eps).rsqrt()
@@ -175,6 +189,7 @@ class GatedDeltaNet(nn.Module):
             config.linear_value_head_dim, config.rms_norm_eps, centered=False
         )
         self.out_proj = nn.Linear(config.linear_value_dim, hidden, bias=False)
+        self.fused_recurrence = None
 
     def forward(
         self,
@@ -184,6 +199,7 @@ class GatedDeltaNet(nn.Module):
         native_prefill: bool,
         *,
         verify: bool = False,
+        decode: bool = False,
     ):
         c = self.config
         width = c.linear_conv_kernel_dim
@@ -201,14 +217,28 @@ class GatedDeltaNet(nn.Module):
         q = q.unflatten(-1, (c.linear_num_key_heads, c.linear_key_head_dim))
         k = k.reshape_as(q)
         v = v.unflatten(-1, (c.linear_num_value_heads, c.linear_value_head_dim))
-        decay = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a(hidden).float() + self.dt_bias.float()
-        )
-        beta = self.in_proj_b(hidden).sigmoid()
-        if native_prefill:
-            core, state = native_chunk_gdn(q, k, v, decay, beta, state)
+        a, b = self.in_proj_a(hidden), self.in_proj_b(hidden)
+        if decode and self.fused_recurrence is not None:
+            core, state = self.fused_recurrence(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                verify=verify,
+            )
         else:
-            core, state = delta_rule(q, k, v, decay, beta, state, verify=verify)
+            decay = -self.A_log.float().exp() * F.softplus(
+                a.float() + self.dt_bias.float()
+            )
+            beta = b.sigmoid()
+            if native_prefill:
+                core, state = native_chunk_gdn(q, k, v, decay, beta, state)
+            else:
+                core, state = delta_rule(q, k, v, decay, beta, state, verify=verify)
         gate = self.in_proj_z(hidden).reshape_as(core)
         mixed = self.tp.sum(self.out_proj(self.norm(core, gate).flatten(-2)))
         return mixed, state, window
@@ -314,6 +344,7 @@ class QwenModel(nn.Module):
         length: int = 0,
         verify: bool = False,
         native_prefill: bool = False,
+        decode: bool = False,
     ):
         hidden = self.text.embed_tokens(ids.flatten())
         rotary = self.rotary(positions.flatten(), hidden.dtype)
@@ -340,6 +371,7 @@ class QwenModel(nn.Module):
                     convolution[linear],
                     native_prefill,
                     verify=verify,
+                    decode=decode or verify,
                 )
                 width = convolution.shape[-1]
                 states.append(state)

@@ -38,6 +38,16 @@ def main(argv=None):
     parser.add_argument("--quantization", choices=("bf16", "w8a8"), default="bf16")
     parser.add_argument("--attention", choices=("torch", "native"), default="torch")
     parser.add_argument("--native-gdn-prefill", action="store_true")
+    parser.add_argument(
+        "--fused-rmsnorm",
+        action="store_true",
+        help="use the TorchNPU RMSNorm kernel",
+    )
+    parser.add_argument(
+        "--triton-gdn",
+        action="store_true",
+        help="use fused Triton Ascend recurrence for decode and MTP verify",
+    )
     parser.add_argument("--graph", choices=GRAPH_MODES, default="eager")
     parser.add_argument("--graph-max-pages", type=int, default=32)
     parser.add_argument(
@@ -129,6 +139,8 @@ def main(argv=None):
                 graph_verify_batches=args.graph_verify_batches,
                 attention=args.attention,
                 native_gdn_prefill=args.native_gdn_prefill,
+                fused_rmsnorm=args.fused_rmsnorm,
+                triton_gdn=args.triton_gdn,
             )
             if args.context_length > runner.model.config.max_position_embeddings:
                 raise ValueError("context length exceeds checkpoint position capacity")
