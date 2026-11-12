@@ -40,13 +40,21 @@ def main(argv=None):
     parser.add_argument("--native-gdn-prefill", action="store_true")
     parser.add_argument(
         "--fused-rmsnorm",
-        action="store_true",
-        help="use the TorchNPU RMSNorm kernel",
+        nargs="?",
+        const="on",
+        default="on",
+        choices=("on", "off"),
+        help="use the TorchNPU RMSNorm kernel (default: on)",
+    )
+    parser.add_argument(
+        "--gdn",
+        choices=("fla", "triton", "off"),
+        help="GDN kernel backend (default: fla for eager and ACLGraph)",
     )
     parser.add_argument(
         "--triton-gdn",
         action="store_true",
-        help="use fused Triton Ascend recurrence for decode and MTP verify",
+        help="legacy alias for --gdn triton",
     )
     parser.add_argument("--graph", choices=GRAPH_MODES, default="eager")
     parser.add_argument("--graph-max-pages", type=int, default=32)
@@ -70,6 +78,8 @@ def main(argv=None):
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.triton_gdn and args.gdn not in (None, "triton"):
+        parser.error("--triton-gdn conflicts with --gdn")
     if args.num_speculative_tokens is not None:
         if not 1 <= args.num_speculative_tokens <= args.context_length:
             parser.error(
@@ -139,7 +149,8 @@ def main(argv=None):
                 graph_verify_batches=args.graph_verify_batches,
                 attention=args.attention,
                 native_gdn_prefill=args.native_gdn_prefill,
-                fused_rmsnorm=args.fused_rmsnorm,
+                fused_rmsnorm=args.fused_rmsnorm == "on",
+                gdn_backend=args.gdn,
                 triton_gdn=args.triton_gdn,
             )
             if args.context_length > runner.model.config.max_position_embeddings:

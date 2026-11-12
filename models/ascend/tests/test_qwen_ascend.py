@@ -12,6 +12,7 @@ from resin.backend.ascend.ops import DynamicInt8Linear, tensor_attention
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_ascend import runner as ascend_runner
 from resin_models_ascend.checkpoint import load_model, shard_tensor
+from resin_models_ascend.fla_gdn import FlaGDN
 from resin_models_ascend.model import QwenModel, RMSNorm, TensorParallel, delta_rule
 from resin_models_ascend.runner import QwenAscendRunner
 
@@ -187,6 +188,8 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(
             device=device,
             mtp=mtp,
             num_speculative_tokens=draft_count if mtp else None,
+            gdn_backend="off",
+            fused_rmsnorm=False,
             cache_pages=16,
             prefill_chunk=64,
         )
@@ -262,7 +265,12 @@ def test_mtp_aclgraph_nonzero_states_and_scratch_isolation(
     if device_kind == "cpu":
         install_cpu_graph(monkeypatch)
     runner = QwenAscendRunner(
-        tmp_path, device=device, mtp=True, quantization=quantization
+        tmp_path,
+        device=device,
+        mtp=True,
+        quantization=quantization,
+        gdn_backend="off",
+        fused_rmsnorm=False,
     )
     # Nonzero projections make recurrence rollback and stale output observable.
     torch.manual_seed(17)
@@ -458,6 +466,74 @@ def test_aclgraph_fused_rmsnorm_matches_reference():
 
 
 @torch.inference_mode()
+def test_fla_gdn_uses_distinct_prefix_slots_without_mutating_live_state():
+    # Check the adapter ABI without requiring the extension or an NPU.
+    def recurrent(q, k, v, slots, *, actual_seq_lengths, ssm_state_indices, **_):
+        assert actual_seq_lengths.tolist() == [0, 3, 3]
+        assert ssm_state_indices.tolist() == list(range(6))
+        for base in (0, 3):
+            first = slots[base].clone()
+            for step in range(3):
+                slots[base + step].copy_(first + step + 1)
+        return v
+
+    fla = object.__new__(FlaGDN)
+    fla.metadata = {}
+    fla.recurrent = recurrent
+    q = torch.ones((2, 3, 1, 4), dtype=torch.bfloat16)
+    v = torch.ones((2, 3, 1, 5), dtype=q.dtype)
+    state = torch.arange(40, dtype=torch.float32).view(2, 1, 4, 5)
+    out, prefixes = fla.decode(
+        q,
+        q,
+        v,
+        torch.zeros(2, 3, 1),
+        torch.ones(2, 3, 1, dtype=q.dtype),
+        state,
+        verify=True,
+    )
+    torch.testing.assert_close(out, v)
+    torch.testing.assert_close(
+        prefixes, state[:, None] + torch.arange(1, 4)[None, :, None, None, None]
+    )
+    torch.testing.assert_close(
+        state, torch.arange(40, dtype=state.dtype).view_as(state)
+    )
+
+
+@torch.inference_mode()
+def test_aclgraph_fla_gdn_matches_reference_prefixes_and_prefill():
+    device = npu_device()
+    pytest.importorskip("fla_npu")
+    fla = FlaGDN()
+    torch.manual_seed(22)
+    qkv = torch.randn(2, 4, 16, 128, dtype=torch.bfloat16, device=device)
+    q, k, v = qkv.split((4, 4, 8), dim=2)
+    decay = -torch.rand((2, 4, 8), device=device)
+    beta = torch.rand((2, 4, 8), dtype=q.dtype, device=device)
+    state = torch.randn(2, 8, 128, 128, device=device) * 0.1
+    inputs = (q, k, v, decay, beta, state)
+    graph = DecodeGraph(
+        lambda *args: fla.decode(*args, verify=True), inputs, mode="aclgraph"
+    )
+    for live in (state, state.flip(0)):
+        args = (*inputs[:-1], live)
+        for out, ref in zip(
+            graph.replay(args), delta_rule(*args, verify=True), strict=True
+        ):
+            torch.testing.assert_close(out, ref, rtol=0.04, atol=0.005)
+    # Exercise continuation from a nonzero initial state with a partial chunk.
+    q, k, v = torch.randn(67, 16, 128, device=device, dtype=torch.bfloat16).split(
+        (4, 4, 8), dim=1
+    )
+    decay = -torch.rand((67, 8), device=device)
+    beta = torch.rand((67, 8), dtype=q.dtype, device=device)
+    args = (q, k, v, decay, beta, state[0])
+    for out, ref in zip(fla.prefill(*args), delta_rule(*args), strict=True):
+        torch.testing.assert_close(out, ref, rtol=0.04, atol=0.005)
+
+
+@torch.inference_mode()
 def test_aclgraph_triton_gdn_matches_reference_prefixes():
     device = npu_device()
     pytest.importorskip("triton")
@@ -495,7 +571,11 @@ def test_mtp_batch_verify_matches_independent_rows(
     if mode == "simulated_aclgraph":
         install_cpu_graph(monkeypatch)
     runner = QwenAscendRunner(
-        tmp_path, device=device, num_speculative_tokens=draft_count
+        tmp_path,
+        device=device,
+        num_speculative_tokens=draft_count,
+        gdn_backend="off",
+        fused_rmsnorm=False,
     )
     torch.manual_seed(29)
     for parameter in runner.model.parameters():

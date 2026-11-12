@@ -138,20 +138,26 @@ anchor alone fits in bucket 1. Missing buckets fall back to eager for that
 operation, without runtime capture when startup buckets are configured.
 Every extra verify batch size adds one graph per configured KV page bucket.
 
-### Fused decode operators
+### Fused GDN and RMSNorm
 
-Add `--fused-rmsnorm` to use `torch_npu.npu_rms_norm`. The Qwen
+RMSNorm defaults to `torch_npu.npu_rms_norm` on NPU. The Qwen
 `1 + weight` scale is prepared once at load time. Gated normalization
 keeps FP32 until after the separate SiLU and multiply.
 
-With a compatible Triton Ascend runtime installed, add `--triton-gdn` to
-fuse GDN decay and beta gating, Q/K normalization, and recurrence during
-decode and verify. The kernel keeps FP32 recurrent state and exports every
-prefix state for MTP verification. Convolution, projections, and output
-gating remain separate. This flag supports eager and raw ACLGraph.
-Both flags are opt-in so they can be measured independently against the
-reference. Before using them for a benchmark, run the ACLGraph tests below
-on the target stack and compare greedy outputs for the real checkpoint.
+Eager and raw ACLGraph default to FLA NPU GDN. Install the A2 wheel for
+910B from the [FLA NPU releases](https://github.com/flashserve/flash-linear-attention-npu/releases)
+in the existing CANN/TorchNPU environment, or reuse the same wheel as your
+vLLM Ascend deployment. Resin uses the chunk forward operator for prefill
+and the recurrent operator for decode and verify. The recurrent operator
+writes FP32 states to separate slots for all verify prefixes. It supports
+128-dimensional heads and up to eight query tokens per verify row.
+
+Use `--fused-rmsnorm off` and `--gdn off` for the PyTorch reference.
+`--gdn triton` selects the earlier Triton Ascend decode implementation.
+`npugraph_ex` defaults to reference GDN. The legacy
+`--native-gdn-prefill` explicitly selects the TorchNPU chunk operator.
+Convolution, projections, and output gating are separate from the FLA
+operators. Compare greedy outputs on the target stack before benchmarking.
 
 After rebuilding both packages, run the CPU and NPU tests on the server:
 
@@ -173,6 +179,22 @@ The buffer lifetime rules follow TorchAir's
 [graph memory documentation](https://gitcode.com/Ascend/torchair/blob/master/docs/zh/npugraph_ex/basic/memory_reuse.md).
 This implementation uses the existing raw TorchNPU `NPUGraph` API; it does not
 enable TorchAir graph-pool sharing between draft and verify.
+
+### HTTP timing
+
+Chat Completions streams attach the assistant role to the first generated
+delta. Earlier versions sent a role-only chunk at admission. A client that
+started its decode timer on that chunk could report a very short TTFT and
+attribute prefill wait to TPOT.
+
+For cross-server benchmarks, time the first nonempty content, reasoning, or
+tool-call delta. Ignore role-only chunks and count output tokens from
+`usage.completion_tokens` with `stream_options.include_usage` enabled.
+Compare the client measurements with `resin.time_to_first_token_ms` and
+`resin.generation_elapsed_ms` in Resin's finish chunk. These are server-side
+measurements starting from request enqueue and first Engine token,
+respectively. Divide generation elapsed time by `completion_tokens - 1` for
+a server-side TPOT estimate when more than one token was generated.
 
 ### Page buckets and validation
 

@@ -190,6 +190,7 @@ class GatedDeltaNet(nn.Module):
         )
         self.out_proj = nn.Linear(config.linear_value_dim, hidden, bias=False)
         self.fused_recurrence = None
+        self.fla_gdn = None
 
     def forward(
         self,
@@ -237,6 +238,13 @@ class GatedDeltaNet(nn.Module):
             beta = b.sigmoid()
             if native_prefill:
                 core, state = native_chunk_gdn(q, k, v, decay, beta, state)
+            elif self.fla_gdn is not None:
+                if decode:
+                    core, state = self.fla_gdn.decode(
+                        q, k, v, decay, beta, state, verify=verify
+                    )
+                else:
+                    core, state = self.fla_gdn.prefill(q, k, v, decay, beta, state)
             else:
                 core, state = delta_rule(q, k, v, decay, beta, state, verify=verify)
         gate = self.in_proj_z(hidden).reshape_as(core)

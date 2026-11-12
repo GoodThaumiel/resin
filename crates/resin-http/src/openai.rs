@@ -274,9 +274,14 @@ fn chat_stream(
         let mut terminated = false;
         let created = unix_seconds();
         let mut has_tool_calls = false;
+        let mut sent_role = false;
         while let Some(event) = receiver.recv().await {
-            let value = match event {
-                GenerationEvent::Started { .. } => chat_chunk(&request, created, json!({"role": "assistant", "content": ""}), None),
+            let has_output = matches!(&event,
+                GenerationEvent::ReasoningDelta(_) | GenerationEvent::TextDelta { .. }
+                | GenerationEvent::ToolCallStart { .. } | GenerationEvent::ToolCallArgumentsDelta { .. });
+            let mut value = match event {
+                // Started is emitted at admission, before prefill.
+                GenerationEvent::Started { .. } => continue,
                 GenerationEvent::ReasoningDelta(delta) => chat_chunk(&request, created, json!({"reasoning_content": delta}), None),
                 GenerationEvent::TextDelta { delta, logprobs } => {
                     let mut chunk = chat_chunk(&request, created, json!({"content": delta}), None);
@@ -317,6 +322,9 @@ fn chat_stream(
                         "time_to_first_token_ms": time_to_first_token_ms,
                         "tokens_per_second": tokens_per_second,
                     });
+                    if !sent_role {
+                        chunk["choices"][0]["delta"]["role"] = json!("assistant");
+                    }
                     yield Ok(Event::default().data(chunk.to_string()));
                     if include_usage {
                         yield Ok(Event::default().data(json!({
@@ -336,6 +344,10 @@ fn chat_stream(
                     break;
                 }
             };
+            if has_output && !sent_role {
+                value["choices"][0]["delta"]["role"] = json!("assistant");
+                sent_role = true;
+            }
             yield Ok(Event::default().data(value.to_string()));
         }
         if !terminated {

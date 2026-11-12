@@ -331,6 +331,33 @@ fn text_score_transport_defaults_empty_and_preserves_attached_scores() {
 }
 
 #[tokio::test]
+async fn chat_stream_sends_role_with_first_generated_delta() {
+    let events = stream_events(
+        test_router(),
+        Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true,
+                    "stream_options": {"include_usage": true}
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        events[0]["choices"][0]["delta"],
+        json!({"role": "assistant", "reasoning_content": "brief thought"})
+    );
+    assert_eq!(events[1]["choices"][0]["delta"], json!({"content": "hello"}));
+    assert_eq!(events[2]["resin"]["time_to_first_token_ms"], 10.0);
+    assert_eq!(events[3]["usage"]["completion_tokens"], 2);
+}
+
+#[tokio::test]
 async fn chat_stream_attaches_canonical_scores_to_the_matching_text_chunk() {
     let events = stream_events(
         scored_router(),

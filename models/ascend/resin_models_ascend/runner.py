@@ -71,7 +71,8 @@ class QwenAscendRunner:
         graph: str = "eager",
         attention: str = "torch",
         native_gdn_prefill: bool = False,
-        fused_rmsnorm: bool = False,
+        fused_rmsnorm: bool | None = None,
+        gdn_backend: str | None = None,
         triton_gdn: bool = False,
     ) -> None:
         if num_speculative_tokens is not None and (
@@ -136,10 +137,24 @@ class QwenAscendRunner:
             raise ValueError("native attention requires an NPU")
         if native_gdn_prefill and device.type != "npu":
             raise ValueError("native GDN prefill requires an NPU")
-        if (fused_rmsnorm or triton_gdn) and device.type != "npu":
-            raise ValueError("fused RMSNorm and Triton GDN require an NPU")
-        if triton_gdn and graph == "npugraph_ex":
-            raise ValueError("Triton GDN supports eager execution and raw ACLGraph")
+        if fused_rmsnorm is None:
+            fused_rmsnorm = device.type == "npu"
+        if triton_gdn:
+            if gdn_backend not in (None, "triton"):
+                raise ValueError("triton_gdn conflicts with gdn_backend")
+            gdn_backend = "triton"
+        if gdn_backend is None:
+            gdn_backend = (
+                "fla" if device.type == "npu" and graph != "npugraph_ex" else "off"
+            )
+        if gdn_backend not in ("fla", "triton", "off"):
+            raise ValueError("unsupported GDN backend")
+        if (fused_rmsnorm or gdn_backend != "off") and device.type != "npu":
+            raise ValueError("fused RMSNorm and GDN require an NPU")
+        if gdn_backend != "off" and graph == "npugraph_ex":
+            raise ValueError("fused GDN supports eager execution and raw ACLGraph")
+        if gdn_backend == "fla" and verify_width > 8:
+            raise ValueError("FLA GDN supports up to 8 query tokens per request")
         self.model = load_model(
             checkpoint, device, tp, mtp=mtp, quantization=quantization
         )
@@ -151,12 +166,23 @@ class QwenAscendRunner:
             for module in self.model.modules():
                 if isinstance(module, RMSNorm):
                     module.prepare_fused()
-        if triton_gdn:
+        if gdn_backend == "triton":
             from resin_models_ascend.triton_gdn import fused_recurrent_gdn
 
             for module in self.model.modules():
                 if isinstance(module, GatedDeltaNet):
                     module.fused_recurrence = fused_recurrent_gdn
+        if gdn_backend == "fla":
+            from resin_models_ascend.fla_gdn import FlaGDN
+
+            config = self.model.config
+            if (config.linear_key_head_dim, config.linear_value_head_dim) != (128, 128):
+                raise ValueError("FLA GDN requires 128-dimensional key and value heads")
+            fla = FlaGDN()
+            for module in self.model.modules():
+                if isinstance(module, GatedDeltaNet):
+                    module.fla_gdn = fla
+        log.info("Ascend kernels: fused_rmsnorm=%s, gdn=%s", fused_rmsnorm, gdn_backend)
         self.device = device
         self.mtp = mtp
         self.num_speculative_tokens = draft_count
