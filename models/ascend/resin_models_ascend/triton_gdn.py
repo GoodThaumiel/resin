@@ -18,12 +18,28 @@ def _recurrent_gdn(
     State,
     Out,
     NextState,
-    q_stride: tl.constexpr,
-    k_stride: tl.constexpr,
-    v_stride: tl.constexpr,
-    a_stride: tl.constexpr,
-    b_stride: tl.constexpr,
-    state_stride: tl.constexpr,
+    q_stride_row: tl.constexpr,
+    q_stride_step: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_key: tl.constexpr,
+    k_stride_row: tl.constexpr,
+    k_stride_step: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_key: tl.constexpr,
+    v_stride_row: tl.constexpr,
+    v_stride_step: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_value: tl.constexpr,
+    a_stride_row: tl.constexpr,
+    a_stride_step: tl.constexpr,
+    a_stride_head: tl.constexpr,
+    b_stride_row: tl.constexpr,
+    b_stride_step: tl.constexpr,
+    b_stride_head: tl.constexpr,
+    state_stride_row: tl.constexpr,
+    state_stride_head: tl.constexpr,
+    state_stride_key: tl.constexpr,
+    state_stride_value: tl.constexpr,
     steps: tl.constexpr,
     key_heads: tl.constexpr,
     value_heads: tl.constexpr,
@@ -45,10 +61,10 @@ def _recurrent_gdn(
     matrix = keys[:, None] * value_dim + values[None, :]
     state = tl.load(
         State
-        + row * state_stride[0]
-        + head * state_stride[1]
-        + keys[:, None] * state_stride[2]
-        + values[None, :] * state_stride[3],
+        + row * state_stride_row
+        + head * state_stride_head
+        + keys[:, None] * state_stride_key
+        + values[None, :] * state_stride_value,
         mask,
         other=0,
     )
@@ -57,35 +73,39 @@ def _recurrent_gdn(
     for step in range(steps):
         q = tl.load(
             Q
-            + row * q_stride[0]
-            + step * q_stride[1]
-            + q_head * q_stride[2]
-            + keys * q_stride[3],
+            + row * q_stride_row
+            + step * q_stride_step
+            + q_head * q_stride_head
+            + keys * q_stride_key,
             keys < key_dim,
             other=0,
         ).to(tl.float32)
         k = tl.load(
             K
-            + row * k_stride[0]
-            + step * k_stride[1]
-            + q_head * k_stride[2]
-            + keys * k_stride[3],
+            + row * k_stride_row
+            + step * k_stride_step
+            + q_head * k_stride_head
+            + keys * k_stride_key,
             keys < key_dim,
             other=0,
         ).to(tl.float32)
         v = tl.load(
             V
-            + row * v_stride[0]
-            + step * v_stride[1]
-            + head * v_stride[2]
-            + values * v_stride[3],
+            + row * v_stride_row
+            + step * v_stride_step
+            + head * v_stride_head
+            + values * v_stride_value,
             values < value_dim,
             other=0,
         ).to(tl.float32)
         q = q * tl.rsqrt(tl.sum(q * q, 0) + 1e-6) * scale
         k = k * tl.rsqrt(tl.sum(k * k, 0) + 1e-6)
-        a = tl.load(A + row * a_stride[0] + step * a_stride[1] + head * a_stride[2])
-        b = tl.load(B + row * b_stride[0] + step * b_stride[1] + head * b_stride[2])
+        a = tl.load(
+            A + row * a_stride_row + step * a_stride_step + head * a_stride_head
+        )
+        b = tl.load(
+            B + row * b_stride_row + step * b_stride_step + head * b_stride_head
+        )
         x = a.to(tl.float32) + dt
         softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
         # The reference sigmoid rounds to the projection dtype before recurrence.
@@ -132,6 +152,8 @@ def fused_recurrent_gdn(
     next_state = torch.empty(state_shape, dtype=torch.float32, device=v.device)
     value_block = 16
     tiles = triton.cdiv(value_dim, value_block)
+    # Pass scalar strides: older Triton Ascend frontends cannot index a
+    # tuple wrapped in tl.constexpr while building kernel IR.
     _recurrent_gdn[(batch * value_heads * tiles,)](
         q,
         k,
@@ -143,12 +165,12 @@ def fused_recurrent_gdn(
         state,
         out,
         next_state,
-        q.stride(),
-        k.stride(),
-        v.stride(),
-        a.stride(),
-        b.stride(),
-        state.stride(),
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *a.stride(),
+        *b.stride(),
+        *state.stride(),
         steps,
         key_heads,
         value_heads,
