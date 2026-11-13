@@ -57,6 +57,12 @@ def main(argv=None):
         help="legacy alias for --gdn triton",
     )
     parser.add_argument("--graph", choices=GRAPH_MODES, default="eager")
+    parser.add_argument(
+        "--prefill-graph",
+        choices=("off", "piecewise"),
+        default="off",
+        help="capture GDN and MLP segments for full-size prefill chunks",
+    )
     parser.add_argument("--graph-max-pages", type=int, default=32)
     parser.add_argument(
         "--graph-capture-pages",
@@ -157,6 +163,7 @@ def main(argv=None):
                 fused_rmsnorm=args.fused_rmsnorm == "on",
                 gdn_backend=args.gdn,
                 memory_report=args.memory_report,
+                prefill_graph=args.prefill_graph == "piecewise",
                 triton_gdn=args.triton_gdn,
             )
             if args.context_length > runner.model.config.max_position_embeddings:

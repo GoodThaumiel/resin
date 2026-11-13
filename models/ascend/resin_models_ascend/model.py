@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -13,6 +14,7 @@ from resin.backend.ascend.ops import (
     NativePagedAttention,
     native_chunk_gdn,
     tensor_attention,
+    write_kv,
 )
 from resin.models.qwen3_5.config import Qwen35Config
 
@@ -97,6 +99,11 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(d, config.rms_norm_eps)
         self.tp = tp
 
+    def project_kv(self, hidden: Tensor, rotary: tuple[Tensor, Tensor]):
+        k = self.k_proj(hidden).view(-1, self.kv_heads, self.head_dim)
+        v = self.v_proj(hidden).view_as(k)
+        return apply_rotary(self.k_norm(k), *rotary), v
+
     def forward(
         self,
         hidden: Tensor,
@@ -111,11 +118,8 @@ class Attention(nn.Module):
         q, gate = (
             self.q_proj(hidden).view(-1, self.heads, 2 * self.head_dim).chunk(2, dim=-1)
         )
-        k = self.k_proj(hidden).view(-1, self.kv_heads, self.head_dim)
-        v = self.v_proj(hidden).view_as(k)
-        cos, sin = rotary
-        q = apply_rotary(self.q_norm(q), cos, sin)
-        k = apply_rotary(self.k_norm(k), cos, sin)
+        k, v = self.project_kv(hidden, rotary)
+        q = apply_rotary(self.q_norm(q), *rotary)
         if native is None:
             if positions.ndim == 2:
                 q = q.unflatten(0, positions.shape)
@@ -191,6 +195,8 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(config.linear_value_dim, hidden, bias=False)
         self.fused_recurrence = None
         self.fla_gdn = None
+        self.fused_gating = None
+        self.register_buffer("packed_conv_weight", None, persistent=False)
 
     def forward(
         self,
@@ -204,14 +210,17 @@ class GatedDeltaNet(nn.Module):
     ):
         c = self.config
         width = c.linear_conv_kernel_dim
-        window = torch.cat(
-            (convolution, self.in_proj_qkv(hidden).transpose(-2, -1)), dim=-1
-        )
-        # Explicit depthwise dot products also cover one-token graph decode.
-        mixed = (window.float().unfold(-1, width, 1) * self.conv1d.weight.float()).sum(
-            -1
-        )
-        mixed = F.silu(mixed.to(hidden.dtype)).transpose(-2, -1)
+        qkv = self.in_proj_qkv(hidden)
+        window = torch.cat((convolution, qkv.transpose(-2, -1)), dim=-1)
+        if self.packed_conv_weight is not None:
+            mixed = self.fla_gdn.convolve(
+                qkv, convolution, self.packed_conv_weight, decode=decode
+            )
+        else:
+            mixed = (
+                window.float().unfold(-1, width, 1) * self.conv1d.weight.float()
+            ).sum(-1)
+            mixed = F.silu(mixed.to(hidden.dtype)).transpose(-2, -1)
         q, k, v = mixed.split(
             (c.linear_key_dim, c.linear_key_dim, c.linear_value_dim), dim=-1
         )
@@ -232,10 +241,13 @@ class GatedDeltaNet(nn.Module):
                 verify=verify,
             )
         else:
-            decay = -self.A_log.float().exp() * F.softplus(
-                a.float() + self.dt_bias.float()
-            )
-            beta = b.sigmoid()
+            if self.fused_gating is not None:
+                decay, beta = self.fused_gating(a, b, self.A_log, self.dt_bias)
+            else:
+                decay = -self.A_log.float().exp() * F.softplus(
+                    a.float() + self.dt_bias.float()
+                )
+                beta = b.sigmoid()
             if native_prefill:
                 core, state = native_chunk_gdn(q, k, v, decay, beta, state)
             elif self.fla_gdn is not None:
@@ -287,6 +299,23 @@ class DecoderLayer(nn.Module):
     def finish(self, residual: Tensor, mixed: Tensor) -> Tensor:
         hidden = residual + mixed
         return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+
+def prefill_gdn_segment(
+    layers: Sequence[DecoderLayer],
+    hidden: Tensor,
+    recurrent: Tensor,
+    convolution: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    states, windows = [], []
+    for layer, state, history in zip(layers, recurrent, convolution, strict=True):
+        mixed, state, window = layer.linear_attn(
+            layer.input_layernorm(hidden), state, history, False
+        )
+        hidden = layer.finish(hidden, mixed)
+        states.append(state)
+        windows.append(window[..., hidden.shape[0] :])
+    return hidden, torch.stack(states), torch.stack(windows)
 
 
 class TextModel(nn.Module):
@@ -353,12 +382,27 @@ class QwenModel(nn.Module):
         verify: bool = False,
         native_prefill: bool = False,
         decode: bool = False,
+        prefill_segments: dict[int, tuple[int, Callable]] | None = None,
     ):
         hidden = self.text.embed_tokens(ids.flatten())
         rotary = self.rotary(positions.flatten(), hidden.dtype)
         states, windows = [], []
         full = linear = 0
-        for layer in self.text.layers:
+        skip_until = 0
+        for index, layer in enumerate(self.text.layers):
+            if index < skip_until:
+                continue
+            if prefill_segments is not None and index in prefill_segments:
+                count, replay = prefill_segments[index]
+                stop = linear + count
+                hidden, segment_states, segment_windows = replay(
+                    (hidden, recurrent[linear:stop], convolution[linear:stop])
+                )
+                states.extend(segment_states.unbind())
+                windows.extend(segment_windows.unbind())
+                linear = stop
+                skip_until = index + count
+                continue
             normalized = layer.input_layernorm(hidden)
             if layer.kind == "full_attention":
                 mixed = layer.self_attn(
@@ -399,6 +443,31 @@ class QwenModel(nn.Module):
             torch.stack(windows),
         )
 
+    def _draft_input(self, ids: Tensor, previous: Tensor) -> tuple[MTP, Tensor]:
+        mtp = self.mtp
+        if mtp is None:
+            raise RuntimeError("MTP weights were not loaded")
+        embedding = mtp.pre_fc_norm_embedding(self.text.embed_tokens(ids))
+        hidden = mtp.fc(
+            torch.cat((embedding, mtp.pre_fc_norm_hidden(previous)), dim=-1)
+        )
+        return mtp, hidden
+
+    def prime_draft(
+        self,
+        ids: Tensor,
+        previous: Tensor,
+        positions: Tensor,
+        slots: Tensor,
+        keys: Tensor,
+        values: Tensor,
+    ) -> None:
+        mtp, hidden = self._draft_input(ids, previous)
+        layer = mtp.layers[0]
+        rotary = self.rotary(positions - 1, hidden.dtype)
+        k, v = layer.self_attn.project_kv(layer.input_layernorm(hidden), rotary)
+        write_kv(keys, values, k, v, slots)
+
     def draft(
         self,
         ids: Tensor,
@@ -409,13 +478,7 @@ class QwenModel(nn.Module):
         keys: Tensor,
         values: Tensor,
     ) -> Tensor:
-        mtp = self.mtp
-        if mtp is None:
-            raise RuntimeError("MTP weights were not loaded")
-        embedding = mtp.pre_fc_norm_embedding(self.text.embed_tokens(ids))
-        hidden = mtp.fc(
-            torch.cat((embedding, mtp.pre_fc_norm_hidden(previous)), dim=-1)
-        )
+        mtp, hidden = self._draft_input(ids, previous)
         layer = mtp.layers[0]
         mixed = layer.self_attn(
             layer.input_layernorm(hidden),

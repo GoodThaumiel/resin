@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,12 @@ from resin.backend.sampling import (
 )
 from resin.backend.topology import ParallelismCapabilities
 from resin_models_ascend.checkpoint import load_model
-from resin_models_ascend.model import GatedDeltaNet, RMSNorm, TensorParallel
+from resin_models_ascend.model import (
+    GatedDeltaNet,
+    RMSNorm,
+    TensorParallel,
+    prefill_gdn_segment,
+)
 
 log = logging.getLogger(__name__)
 PAGE_TOKENS = 128
@@ -75,6 +81,7 @@ class QwenAscendRunner:
         gdn_backend: str | None = None,
         triton_gdn: bool = False,
         memory_report: bool = False,
+        prefill_graph: bool = False,
     ) -> None:
         if num_speculative_tokens is not None and (
             type(num_speculative_tokens) is not int
@@ -156,6 +163,14 @@ class QwenAscendRunner:
             raise ValueError("fused GDN supports eager execution and raw ACLGraph")
         if gdn_backend == "fla" and verify_width > 8:
             raise ValueError("FLA GDN supports up to 8 query tokens per request")
+        if prefill_graph and (
+            device.type != "npu"
+            or tp.size != 1
+            or graph == "npugraph_ex"
+            or gdn_backend != "fla"
+            or native_gdn_prefill
+        ):
+            raise ValueError("piecewise prefill requires single-card FLA GDN")
         self.device = device
         self.memory_report = memory_report
         self._report_memory("before_model")
@@ -179,6 +194,13 @@ class QwenAscendRunner:
         if gdn_backend == "fla":
             from resin_models_ascend.fla_gdn import FlaGDN
 
+            try:
+                from resin_models_ascend.triton_gating import fused_gdn_gating
+            except ModuleNotFoundError as error:
+                if error.name != "triton":
+                    raise
+                fused_gdn_gating = None
+                log.warning("Triton Ascend unavailable; using reference GDN gating")
             config = self.model.config
             if (config.linear_key_head_dim, config.linear_value_head_dim) != (128, 128):
                 raise ValueError("FLA GDN requires 128-dimensional key and value heads")
@@ -186,6 +208,15 @@ class QwenAscendRunner:
             for module in self.model.modules():
                 if isinstance(module, GatedDeltaNet):
                     module.fla_gdn = fla
+                    module.fused_gating = fused_gdn_gating
+                    module.packed_conv_weight = (
+                        module.conv1d.weight.detach().squeeze(1).t().contiguous()
+                    )
+            log.info(
+                "Ascend FLA: prefill=%s, recurrence=fla, conv=fla, gating=%s",
+                "torch_npu_chunk" if native_gdn_prefill else "fla_chunk",
+                "triton" if fused_gdn_gating is not None else "torch",
+            )
         log.info("Ascend kernels: fused_rmsnorm=%s, gdn=%s", fused_rmsnorm, gdn_backend)
         self._report_memory("after_model")
         self.mtp = mtp
@@ -213,6 +244,9 @@ class QwenAscendRunner:
         self.graph_capture_pages = capture_pages
         self.graph_verify_batches = tuple(sorted({1, *(graph_verify_batches or ())}))
         self.graphs: dict[tuple[str, int, int], DecodeGraph] = {}
+        self.prefill_graph = prefill_graph
+        self.prefill_chunk = prefill_chunk
+        self.prefill_segments = {}
         self.graph_replays = 0
         self.graph_fallbacks = 0
         self.drafted = self.accepted = 0
@@ -241,7 +275,41 @@ class QwenAscendRunner:
         self._report_memory("after_kv")
         if self.graph_capture_pages is not None:
             self._capture_startup_graphs(self.graph_capture_pages)
+        if self.prefill_graph:
+            self._capture_prefill_segments()
         self.binding.commit(pool_id)
+
+    @torch.inference_mode()
+    def _capture_prefill_segments(self) -> None:
+        layers = tuple(self.model.text.layers)
+        state = self._empty_state()
+        hidden = state.hidden.new_zeros((self.prefill_chunk, state.hidden.shape[-1]))
+        index = linear = 0
+        while index < len(layers):
+            if layers[index].kind == "full_attention":
+                index += 1
+                continue
+            end = index + 1
+            while end < len(layers) and layers[end].kind != "full_attention":
+                end += 1
+            count = end - index
+            stop = linear + count
+            label = f"prefill/layers={index}-{end - 1}/tokens={self.prefill_chunk}"
+            log.info("Capturing Ascend %s", label)
+            self._report_memory(f"before_capture/{label}")
+            inputs = (
+                hidden,
+                state.recurrent[linear:stop],
+                state.convolution[linear:stop],
+            )
+            graph = DecodeGraph(
+                partial(prefill_gdn_segment, layers[index:end]), inputs, mode="aclgraph"
+            )
+            graph.replay(inputs)
+            torch.npu.synchronize(self.device)
+            self.prefill_segments[index] = count, graph.replay
+            self._report_memory(f"after_capture/{label}")
+            index, linear = end, stop
 
     def _report_memory(self, stage: str) -> None:
         if not self.memory_report or self.device.type != "npu":
@@ -397,9 +465,12 @@ class QwenAscendRunner:
     @torch.inference_mode()
     def _capture_startup_graphs(self, buckets: tuple[int, ...]) -> None:
         state = self._empty_state()
-        kinds = ("target", "verify", "draft") if self.mtp else ("target",)
-        if self.num_speculative_tokens > 1:
-            kinds += ("draft_chain",)
+        kinds = ("target",)
+        if self.mtp:
+            kinds += (
+                "verify",
+                "draft_chain" if self.num_speculative_tokens > 1 else "draft",
+            )
         verify_width = 1 + self.num_speculative_tokens
         for bucket in buckets:
             for kind in kinds:
@@ -503,6 +574,9 @@ class QwenAscendRunner:
             verify=verify,
             native_prefill=self.native_gdn_prefill and not decode,
             decode=decode,
+            prefill_segments=self.prefill_segments
+            if not decode and len(ids) == self.prefill_chunk
+            else None,
         )
 
     def _draft(self, ids, hidden, group, row, start, *, decode=False):
@@ -568,6 +642,17 @@ class QwenAscendRunner:
         if eligible:
             self._graph_fallback("draft_chain", bucket)
         return self._run_draft_chain(*inputs)
+
+    def _prime_draft(self, ids, hidden, group, row, start) -> None:
+        positions, _, slots = self._page_metadata(group, row, start, start + len(ids))
+        self.model.prime_draft(
+            ids,
+            hidden,
+            self._long(positions),
+            self._long(slots),
+            self.draft_keys,
+            self.draft_values,
+        )
 
     def _verify_targets(self, group, rows):
         batch_size = len(rows)
@@ -658,13 +743,12 @@ class QwenAscendRunner:
             if accepted:
                 # The draft chain used its own hidden states. Rebuild the
                 # committed draft KV from the verified target hidden states.
-                self._draft(
+                self._prime_draft(
                     drafts[index, :accepted],
                     hidden[index, :accepted],
                     cache.groups[MTP],
                     row,
                     context + 1,
-                    decode=True,
                 )
             results[row] = (
                 scores[index],
@@ -765,14 +849,7 @@ class QwenAscendRunner:
                 skip = int(context == 0)
                 if len(ids) > skip:
                     previous = torch.cat((state.hidden, hidden[:-1]))[skip:]
-                    self._draft(
-                        ids[skip:],
-                        previous,
-                        group,
-                        row,
-                        context + skip,
-                        decode=decode,
-                    )
+                    self._prime_draft(ids[skip:], previous, group, row, context + skip)
             if plan.needs_prompt_logprobs:
                 # Shared scoring kernels use the CPU compiler here.
                 def project_for_scores(selected: Tensor) -> Tensor:

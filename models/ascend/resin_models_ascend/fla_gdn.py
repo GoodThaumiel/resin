@@ -15,6 +15,8 @@ class FlaGDN:
     def __init__(self) -> None:
         try:
             from fla_npu.ops.ascendc import (
+                causal_conv1d_fn,
+                causal_conv1d_update,
                 chunk_gated_delta_rule_fwd,
                 recurrent_gated_delta_rule,
             )
@@ -25,7 +27,41 @@ class FlaGDN:
             ) from error
         self.chunk = chunk_gated_delta_rule_fwd
         self.recurrent = recurrent_gated_delta_rule
+        self.conv_prefill = causal_conv1d_fn
+        self.conv_update = causal_conv1d_update
         self.metadata: dict[tuple[torch.device, int, int], tuple[Tensor, Tensor]] = {}
+        self.initialized_conv_rows: dict[tuple[torch.device, int], Tensor] = {}
+
+    def convolve(self, qkv: Tensor, history: Tensor, weight: Tensor, *, decode: bool):
+        single = qkv.ndim == 2
+        x = (qkv[None] if single else qkv).contiguous()
+        state = (
+            (history[None] if single else history)
+            .transpose(-2, -1)
+            .clone(memory_format=torch.contiguous_format)
+        )
+        # FLA updates its private state. The caller builds the live prefix
+        # windows separately from the original, unmodified projections.
+        if decode:
+            output = self.conv_update(
+                x, state, weight, activation="silu", out=torch.empty_like(x)
+            )
+        else:
+            key = x.device, x.shape[0]
+            if key not in self.initialized_conv_rows:
+                # New requests already have a zero-filled history.
+                self.initialized_conv_rows[key] = torch.ones(
+                    x.shape[0], dtype=torch.bool, device=x.device
+                )
+            output = self.conv_prefill(
+                x,
+                weight,
+                None,
+                conv_states=state,
+                has_initial_state=self.initialized_conv_rows[key],
+                activation="silu",
+            )
+        return output[0] if single else output
 
     def decode(self, q, k, v, decay, beta, state, *, verify: bool):
         single = q.ndim == 3

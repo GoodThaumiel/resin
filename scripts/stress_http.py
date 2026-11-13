@@ -203,9 +203,27 @@ async def run_case(client: httpx.AsyncClient, case: Case, timeout: float):
                         if data == "[DONE]":
                             done = True
                             break
-                        meaningful = tracker.add(json.loads(data), stream=True)
+                        elapsed = (time.perf_counter() - started) * 1000
+                        if "first_sse_ms" not in result:
+                            result["first_sse_ms"] = elapsed
+                        value = json.loads(data)
+                        meaningful = tracker.add(value, stream=True)
+                        if "first_visible_ms" not in result and any(
+                            choice["delta"].get(key)
+                            for choice in value["choices"]
+                            for key in ("content", "reasoning_content", "tool_calls")
+                        ):
+                            result["first_visible_ms"] = elapsed
                         if meaningful and result["ttft_ms"] is None:
-                            result["ttft_ms"] = (time.perf_counter() - started) * 1000
+                            result["ttft_ms"] = elapsed
+                        if meaningful:
+                            result["last_output_ms"] = elapsed
+                        server = value.get("resin", {})
+                        if "time_to_first_token_ms" in server:
+                            result["server_ttft_ms"] = server["time_to_first_token_ms"]
+                            result["server_generation_ms"] = server[
+                                "generation_elapsed_ms"
+                            ]
                         if case.disconnect and meaningful:
                             result.update(disconnected=True, events=tracker.events)
                             break
@@ -217,6 +235,15 @@ async def run_case(client: httpx.AsyncClient, case: Case, timeout: float):
                         if not done:
                             raise ValueError("SSE stream ended without [DONE]")
                         result.update(tracker.finish(body["max_tokens"]))
+                        count = result["completion_tokens"]
+                        if count > 1 and result["ttft_ms"] is not None:
+                            result["tpot_ms"] = (
+                                result["last_output_ms"] - result["ttft_ms"]
+                            ) / (count - 1)
+                        if count > 1 and "server_generation_ms" in result:
+                            result["server_tpot_ms"] = result[
+                                "server_generation_ms"
+                            ] / (count - 1)
                 else:
                     tracker.add(json.loads(await response.aread()), stream=False)
                     result.update(tracker.finish(body["max_tokens"]))
@@ -418,7 +445,9 @@ async def main(args):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "url": base_url,
         "configuration": {
-            key: value for key, value in vars(args).items() if key != "output"
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+            if key != "output"
         },
         "ttft_definition": "First nonempty content, reasoning, tool, or raw-token SSE event; includes network and queueing. JSON requests have no TTFT sample.",
         "stages": [],
@@ -442,10 +471,31 @@ async def main(args):
             response.raise_for_status()
             model = response.json()["data"][0]["id"]
         report["model"] = model
+        request = None
+        if request_path := getattr(args, "request_json", None):
+            request = json.loads(request_path.read_text())
+            if not isinstance(request, dict):
+                raise ValueError(
+                    "--request-json must contain a Chat Completions object"
+                )
+            request = {
+                **request,
+                "model": model,
+                "stream": True,
+                "stream_options": {
+                    **(request.get("stream_options") or {}),
+                    "include_usage": True,
+                },
+                "max_tokens": request.get("max_tokens", args.max_tokens),
+            }
         stages = [
             (
                 "warmup",
-                [chat_case(model, i, args.dp_size, 16) for i in range(args.dp_size)],
+                [Case(name="warmup", body=request)]
+                if request is not None
+                else [
+                    chat_case(model, i, args.dp_size, 16) for i in range(args.dp_size)
+                ],
                 1,
             )
         ]
@@ -453,14 +503,18 @@ async def main(args):
             (
                 f"load-c{c}",
                 [
-                    chat_case(model, i, args.dp_size, args.max_tokens)
+                    (
+                        Case(name=f"request-{i}", body=request)
+                        if request is not None
+                        else chat_case(model, i, args.dp_size, args.max_tokens)
+                    )
                     for i in range(args.requests)
                 ],
                 c,
             )
             for c in args.concurrency
         )
-        if not args.skip_robustness:
+        if request is None and not args.skip_robustness:
             stages.append(
                 (
                     "robustness",
@@ -468,22 +522,23 @@ async def main(args):
                     min(8, max(args.concurrency)),
                 )
             )
-        stages.append(
-            (
-                "recovery",
-                [
-                    Case(
-                        name=f"recovery-rank-{i}",
-                        body={
-                            **dict(chat_case(model, i, args.dp_size, 32).body),
-                            "routed_dp_rank": i,
-                        },
-                    )
-                    for i in range(args.dp_size)
-                ],
-                args.dp_size,
+        if request is None:
+            stages.append(
+                (
+                    "recovery",
+                    [
+                        Case(
+                            name=f"recovery-rank-{i}",
+                            body={
+                                **dict(chat_case(model, i, args.dp_size, 32).body),
+                                "routed_dp_rank": i,
+                            },
+                        )
+                        for i in range(args.dp_size)
+                    ],
+                    args.dp_size,
+                )
             )
-        )
         for name, cases, concurrency in stages:
             report["stages"].append(
                 await run_stage(
@@ -514,6 +569,11 @@ if __name__ == "__main__":
         "--requests", type=int, default=128, help="Requests per concurrency stage"
     )
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--request-json",
+        type=Path,
+        help="reuse this Chat Completions request for every load-stage request",
+    )
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument(
         "--api-key-env", help="Environment variable containing an optional bearer token"

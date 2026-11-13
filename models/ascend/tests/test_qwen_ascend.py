@@ -212,10 +212,8 @@ def test_mtp_matches_target_across_page_and_prefill_chunks(
             kinds = {
                 "target",
                 "verify",
-                "draft",
+                "draft_chain" if draft_count > 1 else "draft",
             }
-            if draft_count > 1:
-                kinds.add("draft_chain")
             assert {kind for kind, _, _ in runner.graphs} == kinds
             assert runner.graph_replays > 0
             assert runner.graph_fallbacks == 0
@@ -499,6 +497,153 @@ def test_fla_gdn_uses_distinct_prefix_slots_without_mutating_live_state():
     torch.testing.assert_close(
         state, torch.arange(40, dtype=state.dtype).view_as(state)
     )
+
+
+@torch.inference_mode()
+def test_mtp_cache_priming_matches_draft_forward(tmp_path):
+    make_checkpoint(tmp_path)
+    runner = QwenAscendRunner(tmp_path, device=torch.device("cpu"), mtp=True)
+    torch.manual_seed(33)
+    for param in runner.model.parameters():
+        param.normal_(std=0.1)
+    c = runner.model.config
+    keys = torch.zeros(
+        (3, 128, c.num_key_value_heads, c.head_dim), dtype=torch.bfloat16
+    )
+    values = torch.zeros_like(keys)
+    expected_keys, expected_values = keys.clone(), values.clone()
+    ids = torch.tensor([4, 5, 6])
+    positions = torch.tensor([127, 128, 129])
+    pages = torch.tensor([2, 1])
+    slots = torch.tensor([383, 128, 129])
+    previous = torch.randn(3, c.hidden_size, dtype=keys.dtype)
+    runner.model.draft(
+        ids, previous, positions, pages, slots, expected_keys, expected_values
+    )
+    runner.model.prime_draft(ids, previous, positions, slots, keys, values)
+    torch.testing.assert_close(keys, expected_keys, rtol=0, atol=0)
+    torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device_kind", ["cpu", "npu"])
+@torch.inference_mode()
+def test_piecewise_prefill_preserves_chunk_continuation(
+    tmp_path, monkeypatch, device_kind
+):
+    device = npu_device() if device_kind == "npu" else torch.device("cpu")
+    if device.type == "npu":
+        pytest.importorskip("fla_npu")
+    raw_config = {
+        **(NPU_CONFIG if device.type == "npu" else CONFIG),
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+        ],
+    }
+    make_checkpoint(tmp_path, raw_config=raw_config)
+    runner = QwenAscendRunner(tmp_path, device=device, prefill_chunk=64)
+    torch.manual_seed(17)
+    for param in runner.model.parameters():
+        param.normal_(std=0.12)
+    if device.type == "cpu":
+        install_cpu_graph(monkeypatch)
+    else:
+        for module in runner.model.modules():
+            if isinstance(module, RMSNorm):
+                module.prepare_fused()
+        for layer in runner.model.text.layers:
+            if layer.kind == "linear_attention":
+                gdn = layer.linear_attn
+                gdn.packed_conv_weight = gdn.conv1d.weight.squeeze(1).t().contiguous()
+    runner._capture_prefill_segments()
+    assert {index: count for index, (count, _) in runner.prefill_segments.items()} == {
+        0: 1,
+        2: 2,
+    }
+    c = runner.model.config
+    keys = torch.zeros(
+        (1, 3, 128, c.num_key_value_heads, c.head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    values = torch.zeros_like(keys)
+    ref_keys, ref_values = keys.clone(), values.clone()
+    state = runner._empty_state()
+    rec, conv = state.recurrent, state.convolution
+    ref_rec, ref_conv = rec.clone(), conv.clone()
+    tolerance = (
+        dict(rtol=0, atol=0) if device.type == "cpu" else dict(rtol=0.025, atol=0.004)
+    )
+    for context, size in ((0, 64), (64, 64), (128, 3)):
+        ids = (
+            torch.arange(context + 1, context + size + 1, device=device) % c.vocab_size
+        )
+        positions = torch.arange(context, context + size, device=device)
+        metadata = (
+            positions,
+            torch.arange(1, (context + size + 127) // 128 + 1, device=device),
+            positions + 128,
+        )
+        expected, ref_rec, ref_conv = runner.model.target(
+            ids, *metadata, ref_rec, ref_conv, ref_keys, ref_values
+        )
+        actual, rec, conv = runner.model.target(
+            ids,
+            *metadata,
+            rec,
+            conv,
+            keys,
+            values,
+            prefill_segments=runner.prefill_segments if size == 64 else None,
+        )
+        torch.testing.assert_close(actual, expected, **tolerance)
+        torch.testing.assert_close(rec, ref_rec, **tolerance)
+        torch.testing.assert_close(conv, ref_conv, **tolerance)
+        torch.testing.assert_close(keys, ref_keys, **tolerance)
+        torch.testing.assert_close(values, ref_values, **tolerance)
+
+
+@torch.inference_mode()
+def test_aclgraph_fla_causal_conv_and_gating():
+    device = npu_device()
+    pytest.importorskip("fla_npu")
+    fla = FlaGDN()
+    dtype = torch.bfloat16
+    torch.manual_seed(44)
+    weight = torch.randn(4, 128, dtype=dtype, device=device) * 0.1
+    for decode, shape in ((False, (67, 128)), (True, (1, 128)), (True, (2, 4, 128))):
+        x = torch.randn(shape, dtype=dtype, device=device)
+        history = torch.randn((*shape[:-2], 128, 3), dtype=dtype, device=device)
+        original = history.clone()
+        window = torch.cat((history, x.transpose(-2, -1)), dim=-1)
+        ref = (window.float().unfold(-1, 4, 1) * weight.t()[:, None].float()).sum(-1)
+        ref = torch.nn.functional.silu(ref.to(dtype)).transpose(-2, -1)
+        graph = DecodeGraph(
+            lambda x, h: (fla.convolve(x, h, weight, decode=decode),),
+            (x, history),
+            mode="aclgraph",
+        )
+        (out,) = graph.replay((x, history))
+        torch.testing.assert_close(out, ref, rtol=0.025, atol=0.004)
+        torch.testing.assert_close(history, original, rtol=0, atol=0)
+
+    pytest.importorskip("triton")
+    from resin_models_ascend.triton_gating import fused_gdn_gating
+
+    a = torch.randn(2, 4, 16, dtype=dtype, device=device)
+    b = torch.randn_like(a)
+    log, bias = (torch.randn(16, device=device) for _ in range(2))
+    graph = DecodeGraph(
+        lambda a, b: fused_gdn_gating(a, b, log, bias), (a, b), mode="aclgraph"
+    )
+    decay, beta = graph.replay((a, b))
+    torch.testing.assert_close(
+        decay, -log.exp() * torch.nn.functional.softplus(a.float() + bias)
+    )
+    torch.testing.assert_close(beta, b.sigmoid(), rtol=0.01, atol=0.001)
 
 
 @torch.inference_mode()

@@ -104,9 +104,8 @@ The verifier retains a recurrent and convolution state at each prefix.
 Accepted draft KV is rebuilt using the verified target hidden states.
 Writes beyond the accepted prefix are masked and overwritten on later steps.
 
-Each page bucket captures one-token `target`, one-step `draft`, and
-`verify` graphs at startup. For K > 1 it also captures a `draft_chain`
-graph, with all K draft forwards, vocabulary projections, and argmax
+Each page bucket captures `target`, `verify`, and a draft graph at startup.
+For K > 1 it uses `draft_chain`, with all K draft forwards, vocabulary projections, and argmax
 operations. Each eligible request replays this graph once. Its page bucket
 covers all K draft inputs, including chains that cross a page boundary.
 Verify warmup uses distinct slots in the
@@ -124,9 +123,9 @@ dimension misses, verify runs as a batch in eager mode. A batch of one still
 uses the per-request graph. The eager native attention path uses
 per-request verify.
 
-Target logits projection, acceptance decisions, multi-token draft KV repair,
-state commit, and prefill remain eager. A single accepted draft can use the
-one-step draft graph for KV repair. Positive-temperature requests use target-only sampling and
+Target logits projection, acceptance decisions and state commit remain eager.
+Prefill priming and accepted-draft repair project and write only draft K/V.
+Positive-temperature requests use target-only sampling and
 maintain the draft cache. MTP graphs require one NPU and tensor attention;
 `--mtp --graph npugraph_ex`, TP graphs, and native-attention graphs remain
 unsupported. BF16 and dynamic W8A8 use the same graph routing, but each
@@ -156,8 +155,18 @@ Use `--fused-rmsnorm off` and `--gdn off` for the PyTorch reference.
 `--gdn triton` selects the earlier Triton Ascend decode implementation.
 `npugraph_ex` defaults to reference GDN. The legacy
 `--native-gdn-prefill` explicitly selects the TorchNPU chunk operator.
-Convolution, projections, and output gating are separate from the FLA
-operators. Compare greedy outputs on the target stack before benchmarking.
+Linear projections and output gating remain separate. The FLA path uses causal convolution with SiLU
+(`causal_conv1d_fn` for prefill, `causal_conv1d_update` for decode/verify)
+and fused Triton Ascend decay/beta gating when Triton is installed.
+Compare greedy outputs on the target stack before benchmarking.
+
+### Piecewise prefill
+
+Pass `--prefill-graph piecewise` to pre-capture spans of consecutive GDN
+decoder layers, including their projections and MLPs. Each span replays
+for a full `--prefill-chunk`. Full attention, variable-length tails and
+draft KV priming execute eagerly. This mode requires single-card FLA GDN.
+Use `--memory-report` to measure the additional graph allocations.
 
 After rebuilding both packages, run the CPU and NPU tests on the server:
 
@@ -195,6 +204,19 @@ Compare the client measurements with `resin.time_to_first_token_ms` and
 measurements starting from request enqueue and first Engine token,
 respectively. Divide generation elapsed time by `completion_tokens - 1` for
 a server-side TPOT estimate when more than one token was generated.
+
+To compare the same 2k/70 request on both servers, save its JSON body
+with `temperature: 0` and `max_tokens: 70`, then run:
+
+```bash
+python3 scripts/stress_http.py http://127.0.0.1:8000 \
+  --request-json request-2k70.json --concurrency 1 16 --requests 16 \
+  --output resin-2k70.json
+```
+
+The request JSONL reports first SSE data, first visible delta, server TTFT
+when available, and TPOT based on reported completion tokens. Check the
+actual prompt and output token counts, including any chat template tokens.
 
 ### Page buckets and validation
 
