@@ -76,6 +76,11 @@ def main(argv=None):
         type=int,
         help="enable MTP and draft this many tokens by reusing the same MTP head",
     )
+    parser.add_argument(
+        "--memory-report",
+        action="store_true",
+        help="log NPU memory after model and KV allocation and around graph capture",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     if args.triton_gdn and args.gdn not in (None, "triton"):
@@ -151,6 +156,7 @@ def main(argv=None):
                 native_gdn_prefill=args.native_gdn_prefill,
                 fused_rmsnorm=args.fused_rmsnorm == "on",
                 gdn_backend=args.gdn,
+                memory_report=args.memory_report,
                 triton_gdn=args.triton_gdn,
             )
             if args.context_length > runner.model.config.max_position_embeddings:

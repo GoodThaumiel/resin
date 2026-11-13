@@ -198,6 +198,20 @@ a server-side TPOT estimate when more than one token was generated.
 
 ### Page buckets and validation
 
+Pass `--memory-report` to print allocated, reserved, peak allocated, and
+device free memory around model loading, KV allocation, and each capture.
+If startup runs out of memory, the last `before_capture` entry identifies
+the graph kind, page bucket, and batch size. Capture fewer verify batch
+sizes to reduce the memory retained at startup. A missing size uses
+batched eager verify.
+
+For Qwen3.5-4B, each request's FP32 GDN state is 48 MiB before
+convolution and hidden state. MTP3 verify retains four prefix states per
+request. At batch size 16, the stacked recurrent output alone is 3 GiB.
+The layer outputs can coexist with the stacked result during capture.
+The tensor attention path also expands gathered KV heads to query-head
+count, so reducing the page bucket reduces its working set.
+
 With `--graph-capture-pages`, Resin captures and replays each listed bucket
 once on the scratch page before the HTTP listener starts. Sizes are powers of
 two in KV pages of 128 tokens. For example, `1 2 4 8` covers decode lengths

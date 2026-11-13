@@ -74,6 +74,7 @@ class QwenAscendRunner:
         fused_rmsnorm: bool | None = None,
         gdn_backend: str | None = None,
         triton_gdn: bool = False,
+        memory_report: bool = False,
     ) -> None:
         if num_speculative_tokens is not None and (
             type(num_speculative_tokens) is not int
@@ -155,6 +156,9 @@ class QwenAscendRunner:
             raise ValueError("fused GDN supports eager execution and raw ACLGraph")
         if gdn_backend == "fla" and verify_width > 8:
             raise ValueError("FLA GDN supports up to 8 query tokens per request")
+        self.device = device
+        self.memory_report = memory_report
+        self._report_memory("before_model")
         self.model = load_model(
             checkpoint, device, tp, mtp=mtp, quantization=quantization
         )
@@ -183,7 +187,7 @@ class QwenAscendRunner:
                 if isinstance(module, GatedDeltaNet):
                     module.fla_gdn = fla
         log.info("Ascend kernels: fused_rmsnorm=%s, gdn=%s", fused_rmsnorm, gdn_backend)
-        self.device = device
+        self._report_memory("after_model")
         self.mtp = mtp
         self.num_speculative_tokens = draft_count
         self.native = NativePagedAttention(device) if attention == "native" else None
@@ -234,9 +238,28 @@ class QwenAscendRunner:
                 shape, dtype=torch.bfloat16, device=self.device
             )
             self.draft_values = torch.zeros_like(self.draft_keys)
+        self._report_memory("after_kv")
         if self.graph_capture_pages is not None:
             self._capture_startup_graphs(self.graph_capture_pages)
         self.binding.commit(pool_id)
+
+    def _report_memory(self, stage: str) -> None:
+        if not self.memory_report or self.device.type != "npu":
+            return
+        npu = torch.npu
+        free, total = npu.mem_get_info(self.device)
+        mib = 1 << 20
+        log.info(
+            "Ascend memory stage=%s device=%s allocated_mib=%.1f reserved_mib=%.1f "
+            "peak_allocated_mib=%.1f free_mib=%.1f total_mib=%.1f",
+            stage,
+            self.device,
+            npu.memory_allocated(self.device) / mib,
+            npu.memory_reserved(self.device) / mib,
+            npu.max_memory_allocated(self.device) / mib,
+            free / mib,
+            total / mib,
+        )
 
     def release(self, sequence_ids) -> None:
         for sequence in sequence_ids:
@@ -315,6 +338,10 @@ class QwenAscendRunner:
         *,
         startup: bool = False,
     ) -> DecodeGraph:
+        batch_size = inputs[0].shape[0] if inputs[0].ndim == 2 else 1
+        label = f"{kind}/pages={bucket}/batch={batch_size}"
+        self._report_memory(f"before_capture/{label}")
+
         def forward(*args):
             if kind == "draft_chain":
                 return (self._run_draft_chain(*args),)
@@ -341,7 +368,6 @@ class QwenAscendRunner:
         scratch = tuple(scratch)
 
         stage = "startup" if startup else "request"
-        batch_size = inputs[0].shape[0] if inputs[0].ndim == 2 else 1
         log.info(
             "Capturing Ascend decode graph, mode=%s, kind=%s, page bucket=%d, batch=%d, stage=%s",
             self.graph_mode,
@@ -356,6 +382,8 @@ class QwenAscendRunner:
         if startup:
             graph.replay(scratch)
             torch.npu.synchronize(self.device)
+        del scratch
+        self._report_memory(f"after_capture/{label}")
         log.info(
             "Ascend decode graph captured, mode=%s, kind=%s, page bucket=%d, batch=%d, stage=%s",
             self.graph_mode,
